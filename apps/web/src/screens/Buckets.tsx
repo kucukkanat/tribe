@@ -3,7 +3,7 @@ import { Shell } from "../components/Shell";
 import { Dialog, Empty, Skeleton, useAction } from "../components/ui";
 import { IPlus } from "../components/icons";
 import { Bucket, parseInviteLink } from "../lib/core";
-import { getPool, refreshBuckets, state, useApp } from "../lib/state";
+import { getPool, getStore, refreshBuckets, state, useApp } from "../lib/state";
 import { parsePubkey } from "../lib/bech32";
 import { go } from "../lib/router";
 import { DEFAULT_RELAYS } from "../lib/core";
@@ -73,7 +73,7 @@ function RequestAccess({ onClose }: { onClose: () => void }) {
       <button class="btn" onClick={onClose}>Cancel</button>
       <button class="btn primary" disabled={!valid || busy} onClick={() => run(async () => {
         const adminPk = parsePubkey(admin);
-        await Bucket.requestAccess({ identity: state.identity!, bucketId: bucketId.trim().toLowerCase(), adminPk, relays: DEFAULT_RELAYS, name: name || undefined, message: msg || undefined, pool: getPool() });
+        await Bucket.requestAccess({ identity: state.identity!, bucketId: bucketId.trim().toLowerCase(), adminPk, relays: DEFAULT_RELAYS, name: name || undefined, message: msg || undefined, pool: getPool(), store: await getStore() });
         await refreshBuckets();
         onClose();
       }, "Request sent. An admin will see it under Members.")}>Send request</button>

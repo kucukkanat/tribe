@@ -112,10 +112,11 @@ async function seedInner(pool: Pool, store: Store, tick: (h: number) => void): P
 
   // An agent paired as Priya's device.
   const agentId = Identity.generate();
+  await priya.b.sync();
   await priya.b.addDevice(agentId.pk, "claude-code on priya-mbp", "agent");
   let agent: Bucket | null = null;
   try {
-    agent = await Bucket.open({ identity: agentId, bucketId: admin.bucketId, pool, store: new MemoryStore() });
+    agent = await Bucket.open({ identity: agentId, bucketId: admin.bucketId, pool, store: new MemoryStore(), adminHint: maya.pk });
     await agent.sync();
   } catch (e) { console.warn("demo agent open failed; writing as Priya", e); }
 

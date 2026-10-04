@@ -1,6 +1,7 @@
 // Thin adapter over @tribe/core. All web code imports core through this file so
 // any drift between SPEC and implementation is fixed in one place.
 export { Bucket, Identity, MockPool, NostrPool, MemoryStore, parseInviteLink } from "@tribe/core";
+import { buildConnectString } from "@tribe/core";
 export type {
   Entry, EntryVersion, EntryType, EntryBody, Member, Invite, RosterBody, DeviceInfo, Role, Hex, BucketSummary,
 } from "@tribe/core";
@@ -46,7 +47,7 @@ export function rootAdminOf(b: Bucket): string | null {
 
 /** `tribe://<bucketId>?admin=<pk>&relays=<enc>,<enc>` (same format as core's buildConnectString). */
 export function connectString(bucketId: string, admin: string, relays: string[]): string {
-  return `tribe://${bucketId}?admin=${admin}&relays=${relays.map(encodeURIComponent).join(",")}`;
+  return buildConnectString({ bucketId, adminPk: admin, relays });
 }
 
 /** Relays recommended for new buckets (damus rate-limits bursts and doesn't serve gift wraps reliably). */
