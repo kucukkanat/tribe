@@ -5,7 +5,7 @@ import { useAction } from "../components/ui";
 import { Bucket, parseInviteLink } from "../lib/core";
 import { adoptBucket, getPool, getStore, refreshBuckets, setSync, useApp } from "../lib/state";
 import { shortNpub } from "../lib/format";
-import { go } from "../lib/router";
+import { forgetInvite, go } from "../lib/router";
 
 export function Join({ blob }: { blob: string }) {
   const app = useApp();
@@ -39,6 +39,7 @@ export function Join({ blob }: { blob: string }) {
                   adoptBucket(b);
                   setSync(b.bucketId, { state: "ok", at: Date.now() });
                   await refreshBuckets();
+                  forgetInvite();
                   go(`/b/${b.bucketId}`);
                 }, "Joined. Welcome in.");
               }}>

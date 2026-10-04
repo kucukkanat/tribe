@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Shell } from "../components/Shell";
 import { Empty, Skeleton, useAction, useDebounced } from "../components/ui";
-import { ISearch, IPlus, IBranch } from "../components/icons";
+import { ISearch, IPlus, IBranch, IAlert } from "../components/icons";
 import type { Bucket, Entry, EntryType } from "../lib/core";
-import { MAX_BODY_BYTES } from "../lib/core";
+import { MAX_BODY_BYTES, joinStatusOf } from "../lib/core";
 import { useBucket } from "../lib/state";
 import { excerpt, stripTitle } from "../lib/markdown";
 import { ago, byteLen, plural } from "../lib/format";
@@ -72,8 +72,15 @@ function Feed({ bucket }: { bucket: Bucket }) {
   const set = (p: Partial<Filters>) => setF({ ...f, ...p });
   const anyFilter = f.type !== "all" || f.tag || f.source !== "all" || f.conflicts || dq;
 
+  const js = joinStatusOf(bucket);
   return (
     <>
+      {js?.status === "pending" && (
+        <div class="banner indigo" role="status"><IAlert /><div><b>Waiting for an admin to confirm your invite</b><p class="small muted" style={{ margin: "4px 0 0" }}>Your join request was sent. Entries appear here once an admin approves it and shares the bucket key with you. Keep this tab open or come back later.</p></div></div>
+      )}
+      {js?.status === "rejected" && (
+        <div class="banner rust" role="alert"><IAlert /><div><b>Your join request was declined</b><p class="small muted" style={{ margin: "4px 0 0" }}>{js.reason ? `${js.reason}. ` : ""}An admin declined the request, or the invite was revoked, expired or already used. Ask an admin for a new invite link.</p></div></div>
+      )}
       <Composer bucket={bucket} />
       <div class="search">
         <ISearch />

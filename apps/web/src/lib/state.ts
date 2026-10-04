@@ -84,8 +84,9 @@ export async function refreshBuckets() {
 export async function unlock() {
   const r = state.record;
   if (!r || r.kind !== "passkey") return;
-  const sk = await unlockWithPasskey(r);
-  await becomeReady(Identity.fromSecret(sk), r);
+  const { sk, upgraded } = await unlockWithPasskey(r);
+  if (upgraded) { try { await saveRecord(upgraded); } catch (e) { console.warn("could not re-wrap key", e); } }
+  await becomeReady(Identity.fromSecret(sk), upgraded ?? r);
 }
 
 /** Save a freshly created/imported identity. protect = "passkey" | "local". */

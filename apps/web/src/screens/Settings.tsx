@@ -1,8 +1,8 @@
 import { useState } from "preact/hooks";
-import { Shell } from "../components/Shell";
+import { RelayList, Shell } from "../components/Shell";
 import { CopyButton, useAction, useConfirm } from "../components/ui";
 import { IX, IPlus } from "../components/icons";
-import type { Bucket } from "../lib/core";
+import { relayStatusOf, type Bucket } from "../lib/core";
 import { exitDemo, lock, signOut, startDemo, state, useApp, useBucket } from "../lib/state";
 import { download, slug } from "../lib/format";
 import { BucketGate } from "./BucketGate";
@@ -14,6 +14,11 @@ export function Settings({ bucketId }: { bucketId: string }) {
       <BucketGate bucket={bucket} error={error}>{bucket && <SettingsView bucket={bucket} />}</BucketGate>
     </Shell>
   );
+}
+
+/** GitHub Pages project sites (user.github.io/repo) share one origin with every other project of that user. */
+function sharedOrigin(): boolean {
+  return /\.github\.io$/i.test(location.hostname) && location.pathname.replace(/\/+$/, "").split("/").filter(Boolean).length > 0;
 }
 
 function SettingsView({ bucket }: { bucket: Bucket }) {
@@ -50,7 +55,8 @@ function SettingsView({ bucket }: { bucket: Bucket }) {
 
       <div class="panel stack">
         <h2>Relays</h2>
-        <p class="small muted">Every member publishes to and reads from these relays.{!admin && " Only admins can change them."}</p>
+        <p class="small muted">Every member publishes to and reads from these relays.{!admin && " Only admins can change them."} Use at least 3.</p>
+        {(() => { const rs = relayStatusOf(bucket); return rs && <div class="field"><span>Status</span><RelayList bucket={bucket} demo={app.mode === "demo"} status={rs} /></div>; })()}
         {relays.map((r, i) => (
           <div class="relay-row">
             <input class="input mono grow" value={r} disabled={!admin} aria-label={`Relay ${i + 1}`} onInput={(e) => setRelays(relays.map((x, j) => (j === i ? e.currentTarget.value : x)))} />
@@ -79,6 +85,11 @@ function SettingsView({ bucket }: { bucket: Bucket }) {
       <div class="panel stack">
         <h2>Your key</h2>
         <p class="small muted">Your secret key opens every bucket you belong to. Back it up once and never paste it into a website you don't trust.</p>
+        {sharedOrigin() && (
+          <p class="callout">
+            This copy of Tribe runs on <b>{location.hostname}</b>, a shared GitHub Pages origin. Every project site under it can read this browser's storage for the site, including an unencrypted key. Back up your nsec, protect it with a passkey, and for real use deploy Tribe on its own origin (a custom domain or a user/org site).
+          </p>
+        )}
         {app.identity && (
           <>
             <div class="field"><span>Public key (npub)</span><div class="row"><code class="grow" style={{ overflowWrap: "anywhere" }}>{app.identity.npub()}</code><CopyButton text={app.identity.npub()} /></div></div>

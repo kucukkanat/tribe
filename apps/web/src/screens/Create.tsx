@@ -2,14 +2,14 @@ import { useState } from "preact/hooks";
 import { Shell } from "../components/Shell";
 import { useAction } from "../components/ui";
 import { IX, IPlus } from "../components/icons";
-import { Bucket, DEFAULT_RELAYS } from "../lib/core";
+import { Bucket, RECOMMENDED_RELAYS } from "../lib/core";
 import { adoptBucket, getPool, getStore, refreshBuckets, setSync, state } from "../lib/state";
 import { go } from "../lib/router";
 
 export function CreateBucket() {
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
-  const [relays, setRelays] = useState<string[]>(state.mode === "demo" ? ["wss://demo.relay.local"] : [...DEFAULT_RELAYS]);
+  const [relays, setRelays] = useState<string[]>(state.mode === "demo" ? ["wss://demo.relay.local"] : [...RECOMMENDED_RELAYS]);
   const [created, setCreated] = useState<Bucket | null>(null);
   const { busy, run } = useAction();
   const cleanRelays = relays.map((r) => r.trim()).filter(Boolean);
@@ -40,7 +40,10 @@ export function CreateBucket() {
                 <button class="btn ghost" aria-label="Remove relay" onClick={() => setRelays(relays.filter((_, j) => j !== i))}><IX size={16} /></button>
               </div>
             ))}
-            <div><button class="btn sm" onClick={() => setRelays([...relays, "wss://"])}><IPlus size={14} />Add relay</button></div>
+            <div class="row wrap">
+              <button class="btn sm" onClick={() => setRelays([...relays, "wss://"])}><IPlus size={14} />Add relay</button>
+              <span class={`hint ${state.mode === "live" && cleanRelays.length < 3 ? "warn" : ""}`}>Use at least 3 relays. Public relays drop events and go offline.</span>
+            </div>
             <div class="row" style={{ justifyContent: "space-between" }}>
               <button class="btn" onClick={() => setStep(0)}>Back</button>
               <button class="btn primary" disabled={!relaysValid || busy} onClick={() => run(async () => {

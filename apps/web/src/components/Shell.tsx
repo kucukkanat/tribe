@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import type { Bucket } from "../lib/core";
+import { relayStatusOf, type Bucket, type RelayStatus } from "../lib/core";
 import { exitDemo, state, syncBucket, useApp } from "../lib/state";
 import { ago, plural } from "../lib/format";
 import { bucketPath } from "../lib/router";
@@ -14,16 +14,48 @@ export function SyncStatus({ bucket }: { bucket: Bucket }) {
   useEffect(() => { const t = setInterval(() => tick((x) => x + 1), 30_000); return () => clearInterval(t); }, []);
   const s = app.sync[bucket.bucketId] ?? { state: "idle" as const };
   const relays = bucket.relays.length;
+  const [open, setOpen] = useState(false);
+  const rs = app.mode === "demo" ? null : relayStatusOf(bucket);
+  const down = rs ? rs.filter((r) => !r.ok).length : 0;
   const label =
     app.mode === "demo" ? "Demo relays (in memory)" :
     s.state === "syncing" ? "Syncing…" :
     s.state === "error" ? "Sync failed — retry" :
     s.at ? `Synced ${ago(Math.floor(s.at / 1000))}` : "Not synced yet";
   return (
-    <button class="sync" title={s.error ?? `${plural(relays, "relay")}: ${bucket.relays.join(", ")}`} onClick={() => app.mode === "live" && void syncBucket(bucket)}>
-      <span class={`dot ${app.mode === "demo" ? "ok" : s.state}`} />
-      <span>{label}<br /><span class="muted">{plural(relays, "relay")}</span></span>
-    </button>
+    <div class="sync-wrap">
+      <button class="sync" aria-expanded={open} title={s.error ?? `${plural(relays, "relay")}: ${bucket.relays.join(", ")}`} onClick={() => setOpen(!open)}>
+        <span class={`dot ${app.mode === "demo" ? "ok" : s.state === "ok" && down ? "warn" : s.state}`} />
+        <span>{label}<br /><span class="muted">{plural(relays, "relay")}{down ? ` · ${down} unreachable` : ""}</span></span>
+      </button>
+      {open && (
+        <div class="sync-pop" role="dialog" aria-label="Relay status">
+          {s.error && <p class="small" style={{ color: "var(--rust)", margin: "0 0 8px" }}>{s.error}</p>}
+          <RelayList bucket={bucket} demo={app.mode === "demo"} status={rs} />
+          {app.mode === "live" && <button class="btn sm block" style={{ marginTop: 8 }} onClick={() => void syncBucket(bucket)}>Sync now</button>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Per-relay status list (falls back to the plain URL list when core has no relayStatus). */
+export function RelayList({ bucket, demo, status }: { bucket: Bucket; demo: boolean; status: RelayStatus[] | null }) {
+  const rows: (RelayStatus | { url: string; ok?: undefined })[] = status ?? bucket.relays.map((url) => ({ url }));
+  return (
+    <ul class="relay-status">
+      {rows.map((r) => {
+        const st = demo ? "ok" : r.ok === undefined ? "idle" : r.ok ? "ok" : "error";
+        const rr = r as RelayStatus;
+        const detail = demo ? "in memory" : r.ok === undefined ? "unknown"
+          : !r.ok ? (rr.lastError ?? "unreachable")
+          : rr.read === undefined && rr.write === undefined ? "ok"
+          : [rr.read !== undefined && `read ${rr.read ? "ok" : "failed"}`, rr.write !== undefined && `write ${rr.write ? "ok" : "failed"}`].filter(Boolean).join(" · ");
+        return (
+          <li><span class={`dot ${st}`} /><span class="mono grow" style={{ overflowWrap: "anywhere" }}>{r.url.replace(/^wss:\/\//, "")}</span><span class="small muted">{detail}</span></li>
+        );
+      })}
+    </ul>
   );
 }
 

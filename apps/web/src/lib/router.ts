@@ -15,9 +15,24 @@ export type Route =
   | { name: "settings"; bucketId: string }
   | { name: "notfound" };
 
+// The invite blob carries a secret token. Keep it in memory only and strip it from the
+// URL immediately so it never lingers in history, bookmarks or screenshots of the address bar.
+let inviteBlob = "";
+function captureInvite(): void {
+  const h = location.hash.replace(/^#/, "");
+  if (!h.startsWith("/join/") || h.length <= 6) return;
+  inviteBlob = h.slice(6);
+  const url = new URL(location.href);
+  url.hash = "#/join";
+  history.replaceState(history.state, "", url.toString());
+}
+
+/** Forget the in-memory invite token (after a successful join). */
+export function forgetInvite(): void { inviteBlob = ""; }
+
 export function parse(hash: string): Route {
   const h = hash.replace(/^#/, "") || "/";
-  if (h.startsWith("/join/")) return { name: "join", blob: h.slice(6) };
+  if (h === "/join" || h.startsWith("/join/")) return { name: "join", blob: h.length > 6 ? h.slice(6) : inviteBlob };
   const p = h.split("?")[0]!.split("/").filter(Boolean).map(decodeURIComponent);
   if (p.length === 0) return { name: "home" };
   if (p[0] === "welcome") return { name: "welcome" };
@@ -40,9 +55,9 @@ export const bucketPath = (id: string, rest = "") => `#/b/${id}${rest}`;
 export const entryPath = (bid: string, eid: string) => `#/b/${bid}/e/${encodeURIComponent(eid)}`;
 
 export function useRoute(): Route {
-  const [r, set] = useState(() => parse(location.hash));
+  const [r, set] = useState(() => { captureInvite(); return parse(location.hash); });
   useEffect(() => {
-    const on = () => { set(parse(location.hash)); };
+    const on = () => { captureInvite(); set(parse(location.hash)); };
     addEventListener("hashchange", on);
     return () => removeEventListener("hashchange", on);
   }, []);

@@ -2,7 +2,7 @@ import { useState } from "preact/hooks";
 import { Shell } from "../components/Shell";
 import { CopyButton, Empty, useAction, useConfirm } from "../components/ui";
 import { IBot, IChip } from "../components/icons";
-import type { Bucket, DeviceInfo } from "../lib/core";
+import { connectString, rootAdminOf, type Bucket, type DeviceInfo } from "../lib/core";
 import { state, useBucket } from "../lib/state";
 import { parsePubkey } from "../lib/bech32";
 import { ago, shortNpub } from "../lib/format";
@@ -18,8 +18,10 @@ export function Devices({ bucketId }: { bucketId: string }) {
   );
 }
 
-export const mcpConfig = (bucketId: string) =>
-  JSON.stringify({ mcpServers: { tribe: { command: "bunx", args: ["tribe-mcp", "serve", "--bucket", bucketId] } } }, null, 2);
+export const mcpConfig = (connect: string) =>
+  JSON.stringify({ mcpServers: { tribe: { command: "bunx", args: ["tribe-mcp", "serve", "--connect", connect] } } }, null, 2);
+export const claudeCodeCmd = (connect: string) => `claude mcp add tribe -- bunx tribe-mcp serve --connect "${connect}"`;
+const shellQuote = (s: string) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 
 function DevicesView({ bucket }: { bucket: Bucket }) {
   const me = state.identity!.pk;
@@ -32,6 +34,9 @@ function DevicesView({ bucket }: { bucket: Bucket }) {
   const [npub, setNpub] = useState("");
   const [label, setLabel] = useState("");
   const [paired, setPaired] = useState(false);
+  const [client, setClient] = useState<"claude" | "json">("claude");
+  const connect = connectString(bucket.bucketId, rootAdminOf(bucket) ?? me, bucket.relays);
+  const initCmd = `bunx tribe-mcp init --label ${shellQuote(label.trim() || "my-agent")}`;
   const { busy, run } = useAction();
   const confirm = useConfirm();
   let pkErr: string | null = null;
@@ -48,24 +53,43 @@ function DevicesView({ bucket }: { bucket: Bucket }) {
 
       <div class="panel stack">
         <div class="row"><IBot /><h2>Pair an agent</h2></div>
-        <ol class="small" style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 6, color: "var(--ink-2)" }}>
-          <li>On the machine where your agent runs, run <code>bunx tribe-mcp init</code>. It prints an npub.</li>
-          <li>Paste that npub here and give the agent a name you'll recognise.</li>
-          <li>Add the MCP config below to Claude Code or your agent's config.</li>
+        <ol class="small pair-steps">
+          <li>
+            <p>On the machine where your agent runs, create its key. It prints an npub.</p>
+            <label class="field" style={{ marginBottom: 6 }}><span>Agent name</span><input class="input" value={label} onInput={(e) => setLabel(e.currentTarget.value)} placeholder="e.g. claude-code-laptop" /></label>
+            <div class="row"><pre class="snippet wrap grow" style={{ margin: 0 }}>{initCmd}</pre><CopyButton text={initCmd} /></div>
+          </li>
+          <li>
+            <p>Paste that npub here to give the agent its own key to this bucket.</p>
+            <form class="stack" onSubmit={(e) => {
+              e.preventDefault();
+              void run(async () => { await bucket.addDevice(parsePubkey(npub), label.trim() || "agent", "agent"); setPaired(true); setNpub(""); }, "Agent paired");
+            }}>
+              <label class="field"><span>Agent npub</span><input class="input mono" value={npub} onInput={(e) => setNpub(e.currentTarget.value)} placeholder="npub1…" spellcheck={false} aria-invalid={!!pkErr} />
+                {pkErr && <span class="hint" style={{ color: "var(--rust)" }}>{pkErr}</span>}</label>
+              <div><button class="btn primary" disabled={!npub.trim() || !!pkErr || busy}>{busy ? "Pairing…" : "Pair agent"}</button></div>
+            </form>
+          </li>
+          <li>
+            <p>{paired ? "Paired. Now connect your agent:" : "Connect your agent to this bucket:"}</p>
+            <div class="tabs-mini" role="group" aria-label="Agent client" style={{ marginBottom: 6 }}>
+              <button type="button" class="btn sm" aria-pressed={client === "claude"} onClick={() => setClient("claude")}>Claude Code</button>
+              <button type="button" class="btn sm" aria-pressed={client === "json"} onClick={() => setClient("json")}>MCP config (JSON)</button>
+            </div>
+            {client === "claude" ? (
+              <div class="stack" style={{ gap: 6 }}>
+                <div class="spread"><span class="small muted">Run in a terminal</span><CopyButton text={claudeCodeCmd(connect)} /></div>
+                <pre class="snippet wrap">{claudeCodeCmd(connect)}</pre>
+              </div>
+            ) : (
+              <div class="stack" style={{ gap: 6 }}>
+                <div class="spread"><span class="small muted">Add to your agent's MCP config</span><CopyButton text={mcpConfig(connect)} /></div>
+                <pre class="snippet">{mcpConfig(connect)}</pre>
+              </div>
+            )}
+            <p class="hint" style={{ marginTop: 6 }}>The connection string holds only the bucket ID, admin public key and relays. It contains no secrets.</p>
+          </li>
         </ol>
-        <form class="stack" onSubmit={(e) => {
-          e.preventDefault();
-          void run(async () => { await bucket.addDevice(parsePubkey(npub), label.trim() || "agent", "agent"); setPaired(true); setNpub(""); setLabel(""); }, "Agent paired");
-        }}>
-          <label class="field"><span>Agent npub</span><input class="input mono" value={npub} onInput={(e) => setNpub(e.currentTarget.value)} placeholder="npub1…" spellcheck={false} aria-invalid={!!pkErr} />
-            {pkErr && <span class="hint" style={{ color: "var(--rust)" }}>{pkErr}</span>}</label>
-          <label class="field"><span>Name</span><input class="input" value={label} onInput={(e) => setLabel(e.currentTarget.value)} placeholder="e.g. claude-code on work laptop" /></label>
-          <div><button class="btn primary" disabled={!npub.trim() || !!pkErr || busy}>{busy ? "Pairing…" : "Pair agent"}</button></div>
-        </form>
-        <div class="stack" style={{ gap: 8 }}>
-          <div class="spread"><span class="small" style={{ fontWeight: 600 }}>{paired ? "Now add this to your agent's MCP config" : "MCP config"}</span><CopyButton text={mcpConfig(bucket.bucketId)} /></div>
-          <pre class="snippet">{mcpConfig(bucket.bucketId)}</pre>
-        </div>
       </div>
 
       <h2 class="section-title">Your devices</h2>

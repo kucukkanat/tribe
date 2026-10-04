@@ -413,3 +413,18 @@ pre.snippet { margin: 0; font-family: var(--mono); font-size: 0.82rem; padding: 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* relay status */
+.dot.warn { background: var(--amber); }
+.sync-wrap { position: relative; }
+.sync-pop { position: absolute; bottom: calc(100% + 8px); left: 0; width: 280px; z-index: 30; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); box-shadow: var(--shadow); padding: 12px; }
+.relay-status { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 0.82rem; }
+.relay-status li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.relay-status .grow { min-width: 0; }
+.hint.warn, .field .hint.warn { color: var(--amber); }
+.callout { font-size: 0.85rem; color: var(--ink-2); background: var(--amber-soft); border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent); border-radius: var(--r-sm); padding: 10px 12px; }
+.pair-steps { margin: 0; padding-left: 18px; display: grid; gap: 14px; color: var(--ink-2); }
+.pair-steps > li > p { margin: 0 0 6px; }
+.tabs-mini { display: flex; gap: 4px; flex-wrap: wrap; }
+.tabs-mini button[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+pre.snippet.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }

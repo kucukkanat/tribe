@@ -1,9 +1,10 @@
 // Local identity keystore (IndexedDB) with optional WebAuthn-PRF wrapping.
 import { toHex, fromHex } from "./bech32";
+import { Identity } from "./core";
 
 export type KeyRecord =
   | { kind: "local"; pk: string; sk: string; createdAt: number }
-  | { kind: "passkey"; pk: string; credId: string; salt: string; iv: string; wrapped: string; createdAt: number };
+  | { kind: "passkey"; pk: string; credId: string; salt: string; iv: string; wrapped: string; createdAt: number; /** v2: pk bound as AES-GCM AAD */ aad?: 1 };
 
 const DB = "tribe-keystore";
 const STORE = "kv";
@@ -59,6 +60,7 @@ async function prfEval(credId: Uint8Array, salt: Uint8Array): Promise<ArrayBuffe
   const cred = (await navigator.credentials.get({
     publicKey: {
       challenge: rand(32),
+      rpId: location.hostname,
       allowCredentials: [{ type: "public-key", id: buf(credId) }],
       userVerification: "required",
       extensions: { prf: { eval: { first: buf(salt) } } } as AuthenticationExtensionsClientInputs,
@@ -76,7 +78,8 @@ export async function protectWithPasskey(sk: Uint8Array, pk: string, label: stri
   const salt = rand(32);
   const cred = (await navigator.credentials.create({
     publicKey: {
-      rp: { name: "Tribe" },
+      // Pin the RP ID to this exact host (not a registrable parent domain).
+      rp: { name: "Tribe", id: location.hostname },
       user: { id: rand(16), name: label, displayName: label },
       challenge: rand(32),
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
@@ -92,19 +95,37 @@ export async function protectWithPasskey(sk: Uint8Array, pk: string, label: stri
   const out = ext.results?.first ?? (await prfEval(credId, salt));
   const key = await wrappingKey(out);
   const iv = rand(12);
-  const wrapped = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, buf(sk));
-  return { kind: "passkey", pk, credId: b64(credId), salt: b64(salt), iv: b64(iv), wrapped: b64(wrapped), createdAt: Date.now() };
+  const wrapped = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aadFor(pk) }, key, buf(sk));
+  return { kind: "passkey", pk, credId: b64(credId), salt: b64(salt), iv: b64(iv), wrapped: b64(wrapped), createdAt: Date.now(), aad: 1 };
 }
 
-export async function unlockWithPasskey(r: Extract<KeyRecord, { kind: "passkey" }>): Promise<Uint8Array> {
+const aadFor = (pk: string) => new TextEncoder().encode(`tribe/keywrap/v1|${pk.toLowerCase()}`);
+
+/**
+ * Unwrap the secret key. The record's pk is bound as AES-GCM additional data, and the
+ * derived pubkey must equal the stored pk. Legacy records (no AAD) are accepted once and
+ * re-wrapped with AAD; the upgraded record is returned so the caller can persist it.
+ */
+export async function unlockWithPasskey(r: Extract<KeyRecord, { kind: "passkey" }>): Promise<{ sk: Uint8Array; upgraded?: KeyRecord }> {
   const out = await prfEval(unb64(r.credId), unb64(r.salt));
   const key = await wrappingKey(out);
-  try {
-    const sk = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(r.iv) }, key, unb64(r.wrapped));
-    return new Uint8Array(sk);
-  } catch {
-    throw new Error("This passkey does not unlock the stored key.");
+  const iv = unb64(r.iv);
+  const ct = unb64(r.wrapped);
+  let sk: Uint8Array | null = null;
+  let legacy = false;
+  try { sk = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: aadFor(r.pk) }, key, ct)); }
+  catch {
+    if (r.aad) throw new Error("This passkey does not unlock the stored key.");
+    try { sk = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct)); legacy = true; }
+    catch { throw new Error("This passkey does not unlock the stored key."); }
   }
+  let derived: string;
+  try { derived = Identity.fromSecret(sk).pk; } catch { throw new Error("The stored key is corrupted."); }
+  if (derived.toLowerCase() !== r.pk.toLowerCase()) throw new Error("The unlocked key does not match the stored identity. The key store may have been tampered with.");
+  if (!legacy) return { sk };
+  const niv = rand(12);
+  const wrapped = await crypto.subtle.encrypt({ name: "AES-GCM", iv: niv, additionalData: aadFor(r.pk) }, key, buf(sk));
+  return { sk, upgraded: { ...r, iv: b64(niv), wrapped: b64(wrapped), aad: 1 } };
 }
 
 export const localRecord = (sk: Uint8Array, pk: string): KeyRecord => ({ kind: "local", pk, sk: toHex(sk), createdAt: Date.now() });
