@@ -22,6 +22,17 @@ export class Identity {
     }
     return new Identity(hexToBytes(s));
   }
+  /** ADDITION: parse an npub or 64-char hex pubkey to hex. */
+  static parsePubkey(s: string): Hex {
+    s = s.trim();
+    if (s.startsWith("npub")) {
+      const d = nip19.decode(s);
+      if (d.type !== "npub") throw new Error("not an npub");
+      return d.data as string;
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(s)) throw new Error("invalid pubkey");
+    return s.toLowerCase();
+  }
   npub(): string { return nip19.npubEncode(this.pk); }
   nsec(): string { return nip19.nsecEncode(this.sk); }
   sign(t: EventTemplate): VerifiedEvent { return finalizeEvent(t, this.sk); }

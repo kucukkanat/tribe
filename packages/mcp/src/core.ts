@@ -8,6 +8,8 @@ export {
   MockPool,
   NostrPool,
   MemoryStore,
+  buildConnectString,
+  parseConnectString,
 } from "@tribe/core";
 export type {
   Hex,

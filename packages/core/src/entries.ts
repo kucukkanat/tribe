@@ -50,6 +50,27 @@ export class EntryGraph {
     return e.versions.filter((v) => !superseded.has(v.id));
   }
 
+  /** Versions authored by `pk` (signing key) or attributed to member `pk`. */
+  versionsBy(pk: string): EntryVersion[] {
+    const out: EntryVersion[] = [];
+    for (const list of this.byEntry.values()) for (const v of list) if (v.author === pk || v.authorMember === pk) out.push(v);
+    return out;
+  }
+
+  remove(id: string): boolean {
+    if (!this.ids.has(id)) return false;
+    for (const [eid, list] of this.byEntry) {
+      const i = list.findIndex((v) => v.id === id);
+      if (i < 0) continue;
+      list.splice(i, 1);
+      if (!list.length) this.byEntry.delete(eid);
+      this.cache.delete(eid);
+      break;
+    }
+    this.ids.delete(id);
+    return true;
+  }
+
   entryIds() { return this.byEntry.keys(); }
   *all(): Iterable<Entry> { for (const id of this.byEntry.keys()) yield this.get(id)!; }
 }

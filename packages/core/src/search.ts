@@ -19,6 +19,7 @@ export class SearchIndex {
     if (this.ms.has(e.entryId)) this.ms.discard(e.entryId);
     if (!e.head.deleted) this.ms.add(this.doc(e));
   }
+  discard(id: string) { if (this.ms.has(id)) this.ms.discard(id); }
   addAll(entries: Iterable<Entry>) {
     const docs: Doc[] = [];
     for (const e of entries) { if (this.ms.has(e.entryId)) this.ms.discard(e.entryId); if (!e.head.deleted) docs.push(this.doc(e)); }

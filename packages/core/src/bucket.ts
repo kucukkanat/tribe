@@ -4,14 +4,14 @@ import { Identity } from "./identity.ts";
 import type { RelayPool, RelayStatus } from "./pool.ts";
 import type { Store } from "./store/types.ts";
 import {
-  DEFAULT_RELAYS, KIND_DEVICES, KIND_ENTRY, KIND_INNER, KIND_JOIN, KIND_ROSTER, KIND_SNAPSHOT, KIND_WRAP, MAX_BODY_BYTES,
+  DEFAULT_RELAYS, KIND_CUTOFF, KIND_DEVICES, KIND_ENTRY, KIND_INNER, KIND_JOIN, KIND_ROSTER, KIND_SNAPSHOT, KIND_WRAP, MAX_BODY_BYTES,
 } from "./types.ts";
 import type {
-  BucketSummary, DeviceInfo, Entry, EntryBody, EntryType, EntryVersion, Hex, Invite, JoinRequest, JoinRequestView, KeyGrant,
+  BucketSummary, Cutoff, DeviceInfo, Entry, EntryBody, EntryType, EntryVersion, Hex, Invite, JoinRequest, JoinRequestView, KeyGrant,
   Role, RosterBody,
 } from "./types.ts";
 import {
-  blind, bucketTag, bytesToHex, ephemeralKey, hexToBytes, locatorKey, randomHex, symDecrypt, symEncrypt,
+  blind, bucketTag, bytesToHex, ephemeralKey, hexToBytes, locatorKey, randomHex, sha256Hex, symDecrypt, symEncrypt,
 } from "./crypto.ts";
 import { unwrapGrant, wrapGrant } from "./grant.ts";
 import { buildInviteLink, parseInviteLink, signTokenProof, verifyTokenProof } from "./invite.ts";
@@ -21,7 +21,15 @@ import { SearchIndex } from "./search.ts";
 const now = () => Math.floor(Date.now() / 1000);
 const WRAP_OVERLAP = 3 * 86400; // NIP-59 randomizes wrap created_at up to 2 days into the past
 const SYNC_OVERLAP = 600;
-const MAX_PENDING = 2000;
+const MAX_PENDING = 500;
+const MAX_PENDING_BYTES = 5 * 1024 * 1024;
+const MAX_SEEN_WRAPS = 5000;
+const MAX_JOINS_PER_PK = 5;
+const MAX_JOINS = 2000;
+const MAX_JOIN_NAME = 100;
+const MAX_JOIN_MESSAGE = 1000;
+const MAX_QUARANTINE_SENDERS = 20;
+const FUTURE_SKEW = 600;
 const SNAPSHOT_CHUNK = 48_000;
 const tagVal = (e: Event, name: string) => e.tags.find((t) => t[0] === name)?.[1];
 
@@ -40,14 +48,23 @@ interface PersistState {
   tokenSk?: Hex;
   seenWraps: Hex[];
   deviceWrapped: Record<Hex, number>;
+  /** SECURITY: last accepted roster (monotonic floor; never accept a lower epoch). */
+  acc?: { id: Hex; epoch: number; updatedAt: number; admins: Hex[] };
+  /** SECURITY: key grants from senders not (yet) trusted: usable only to decrypt signed control events. */
+  qgrants?: Record<Hex, { n: number; key: Hex }[]>;
+  /** SECURITY: local first-seen time of join events (expiry / single-use ordering). */
+  joinSeen?: Record<Hex, number>;
+  /** SECURITY: invite id this identity joined with. */
+  joinedVia?: string;
+  selfWrapped?: boolean;
 }
 
 /** Version record persisted in kv (inner signed event + resolved metadata). */
 interface VersionRecord { o: string; i: Event; e: number; m: Hex }
 
-interface JoinInfo { ev: Event; pk: Hex; createdAt: number; inviteId?: string; tokenSig?: string; name?: string; message?: string }
+interface JoinInfo { ev: Event; pk: Hex; createdAt: number; seenAt: number; inviteId?: string; tokenSig?: string; name?: string; message?: string }
 
-type ProcessResult = "ok" | "dup" | "pending" | "invalid";
+type ProcessResult = "ok" | "dup" | "pending" | "invalid" | "retry";
 
 class Mutex {
   private p: Promise<unknown> = Promise.resolve();
@@ -92,6 +109,9 @@ export class Bucket {
   private joins = new Map<Hex, JoinInfo>();
   private latestJoinAt = new Map<Hex, number>();
   private validJoins = new Map<Hex, JoinInfo>();
+  private contested = new Set<Hex>();
+  /** pk (member or device) → accepted version ids (null = cutoff announced but chunks not yet verified). */
+  private cutoffs = new Map<Hex, Set<Hex> | null>();
   private graph = new EntryGraph();
   private index = new SearchIndex();
   private seenOuter = new Set<string>();
@@ -114,6 +134,8 @@ export class Bucket {
     this.rosterD = blind(this.loc, "roster");
     this.seenWraps = new Set(st.seenWraps);
     for (const [n, ks] of Object.entries(st.epochKeys)) this.keys.set(Number(n), ks.map(hexToBytes));
+    st.qgrants ??= {};
+    st.joinSeen ??= {};
   }
 
   // ---------- storage keys ----------
@@ -143,8 +165,10 @@ export class Bucket {
     this.index.addAll(this.graph.all());
     const ctl = await this.store.list<Event>(this.prefix + "c/");
     for (const { value } of ctl) this.control.set(value.id, value);
-    const pend = (await this.store.get<Event[]>(this.prefix + "pending")) ?? [];
-    for (const e of pend) this.pending.set(e.id, e);
+    const pend = (await this.store.get<Event[]>(this.prefix + "pending")) ?? []; // legacy single-array format
+    for (const e of pend.slice(0, MAX_PENDING)) this.addPending(e);
+    if (pend.length) await this.store.delete(this.prefix + "pending");
+    for (const { value } of await this.store.list<Event>(this.prefix + "p/")) this.addPending(value);
     this.recomputeControl();
   }
 
@@ -158,6 +182,10 @@ export class Bucket {
   private async persist(newRecords: [string, unknown][] = []) {
     this.st.name = this.name;
     this.st.relays = this.relays;
+    if (this.seenWraps.size > MAX_SEEN_WRAPS) {
+      const keep = [...this.seenWraps].slice(-MAX_SEEN_WRAPS);
+      this.seenWraps = new Set(keep);
+    }
     this.st.seenWraps = [...this.seenWraps];
     this.st.epochKeys = {};
     for (const [n, ks] of this.keys) this.st.epochKeys[n] = ks.map(bytesToHex);
@@ -167,8 +195,24 @@ export class Bucket {
       ...newRecords,
       [Bucket.stateKey(this.identity.pk, this.bucketId), this.st],
       [Bucket.summaryKey(this.identity.pk, this.bucketId), summary],
-      [this.prefix + "pending", [...this.pending.values()]],
     ]);
+  }
+
+  private pendingBytes = 0;
+  private addPending(ev: Event): boolean {
+    if (this.pending.has(ev.id)) return false;
+    const sz = ev.content.length + 512;
+    if (this.pending.size >= MAX_PENDING || this.pendingBytes + sz > MAX_PENDING_BYTES) return false;
+    this.pending.set(ev.id, ev);
+    this.pendingBytes += sz;
+    return true;
+  }
+  private dropPending(id: string): boolean {
+    const ev = this.pending.get(id);
+    if (!ev) return false;
+    this.pending.delete(id);
+    this.pendingBytes -= ev.content.length + 512;
+    return true;
   }
 
   // ---------- keys ----------
@@ -180,14 +224,23 @@ export class Bucket {
     this.keys.set(n, list);
     return true;
   }
+  /** SECURITY: only keys confirmed by an accepted (trusted-admin-signed) roster are used for encryption. */
   private keyFor(n: number): Uint8Array {
-    const k = this.confirmed.get(n) ?? this.keys.get(n)?.[0];
-    if (!k) throw new Error(`no key for epoch ${n}`);
+    const k = this.confirmed.get(n);
+    if (!k) throw new Error(`no confirmed key for epoch ${n}`);
     return k;
   }
-  private tryDecrypt(n: number, payload: string, check?: (key: Uint8Array) => boolean): { key: Uint8Array; text: string } | null {
-    const cands = this.keys.get(n);
-    if (!cands) return null;
+  /** Quarantined (untrusted-sender) candidate keys for epoch n. */
+  private qkeys(n: number): Uint8Array[] {
+    const out: Uint8Array[] = [];
+    for (const list of Object.values(this.st.qgrants ?? {})) for (const e of list) if (e.n === n) { try { out.push(hexToBytes(e.key)); } catch { /* bad hex */ } }
+    return out;
+  }
+  /** `withQuarantine`: also try untrusted-sender keys — only for signature-authenticated control events. */
+  private tryDecrypt(n: number, payload: string, check?: (key: Uint8Array) => boolean, withQuarantine = false): { key: Uint8Array; text: string } | null {
+    let cands = this.keys.get(n) ?? [];
+    if (withQuarantine) cands = [...cands, ...this.qkeys(n)];
+    if (!cands.length) return null;
     const conf = this.confirmed.get(n);
     const ordered = conf ? [conf, ...cands.filter((k) => k !== conf)] : cands;
     for (const key of ordered) {
@@ -198,7 +251,7 @@ export class Bucket {
   }
   private maxKeyEpoch() { let m = -1; for (const n of this.keys.keys()) m = Math.max(m, n); return m; }
   private allEpochs(): { n: number; key: Hex }[] {
-    return [...this.keys.keys()].sort((a, b) => a - b).map((n) => ({ n, key: bytesToHex(this.keyFor(n)) }));
+    return [...this.keys.keys()].sort((a, b) => a - b).map((n) => ({ n, key: bytesToHex(this.confirmed.get(n) ?? this.keys.get(n)![0]!) }));
   }
 
   // ---------- membership ----------
@@ -241,6 +294,7 @@ export class Bucket {
     for (const [member, { devices }] of this.deviceLists) {
       const d = devices.find((x) => x.pk === authorPk);
       if (!d) continue;
+      if (this.contested.has(authorPk) || !this.isOwnerCandidate(member) && !this.roster?.removed?.some((x) => x.pk === member)) continue;
       if (d.revoked && (d.revokedAt === undefined || createdAt > d.revokedAt)) return null; // same-second writes stay valid (second granularity)
       return member;
     }
@@ -248,16 +302,45 @@ export class Bucket {
   }
 
   // ---------- control state ----------
+  private trustedAdmins(): Set<Hex> {
+    return new Set(this.st.acc ? this.st.acc.admins : this.st.rootAdmins);
+  }
+
+  /** Recompute until quarantined grants stop being promoted (bounded). */
   private recomputeControl() {
+    for (let i = 0; i < 4; i++) {
+      this.recomputeOnce();
+      if (!this.promoteQuarantine()) break;
+    }
+  }
+
+  /** SECURITY (C2): grants from senders that became trusted (admin of accepted roster / bound owner) join the key set. */
+  private promoteQuarantine(): boolean {
+    const q = this.st.qgrants ?? {};
+    const trusted = this.trustedAdmins();
+    let changed = false;
+    for (const [sender, list] of Object.entries(q)) {
+      const ok = trusted.has(sender) || (this.memberPk !== null && this.memberPk !== this.identity.pk && sender === this.memberPk && !this.lockedOut);
+      if (!ok) continue;
+      for (const { n, key } of list) { try { if (this.addKey(n, hexToBytes(key))) changed = true; } catch { /* bad hex */ } }
+      delete q[sender];
+    }
+    // a quarantined key that decrypted an accepted (trusted-signed) roster is genuine
+    for (const [n, key] of this.confirmed) if (this.addKey(n, key)) changed = true;
+    return changed;
+  }
+
+  private recomputeOnce() {
     // rosters
     const cands: { ev: Event; body: RosterBody; key: Uint8Array }[] = [];
-    let maxSeenEpochTrusted = -1;
     const undecryptable: Event[] = [];
+    const tmax = now() + FUTURE_SKEW;
     for (const ev of this.control.values()) {
       if (ev.kind !== KIND_ROSTER || tagVal(ev, "d") !== this.rosterD) continue;
+      if (ev.created_at > tmax) continue;
       this.lastRosterAt = Math.max(this.lastRosterAt, ev.created_at);
       const n = Number(tagVal(ev, "epoch"));
-      const d = this.tryDecrypt(n, ev.content);
+      const d = this.tryDecrypt(n, ev.content, undefined, true);
       if (!d) { undecryptable.push(ev); continue; }
       try {
         const body = JSON.parse(d.text) as RosterBody;
@@ -266,11 +349,33 @@ export class Bucket {
       } catch { /* ignore */ }
     }
     cands.sort((a, b) => a.body.epoch - b.body.epoch || a.body.updatedAt - b.body.updatedAt || a.ev.created_at - b.ev.created_at || (a.ev.id < b.ev.id ? -1 : 1));
-    let trusted = new Set<Hex>([...this.st.rootAdmins, ...this.st.trusted]);
+    // SECURITY (C1): monotonic acceptance. Start from the persisted accepted roster (floor); a candidate is accepted
+    // only if signed by an admin of the CURRENTLY accepted roster (root admin bootstrap when none) and strictly newer
+    // (higher epoch, or same epoch with larger updatedAt). Trusted admins come ONLY from the newest accepted roster.
+    const acc0 = this.st.acc;
+    let cur: { epoch: number; updatedAt: number; id: Hex } | null = acc0 ? { epoch: acc0.epoch, updatedAt: acc0.updatedAt, id: acc0.id } : null;
+    let trusted = this.trustedAdmins();
     let accepted: (typeof cands)[number] | null = null;
-    for (const c of cands) {
+    let startIdx = 0;
+    if (!cur) {
+      // Bootstrap (fresh client): rosters are addressable, so history is gone; take the NEWEST roster signed by a
+      // bootstrap anchor (root admin), then follow the chain forward from it. A removed admin can only forge at
+      // epochs it holds keys for, which are older than the root admin's latest roster.
+      for (let i = cands.length - 1; i >= 0; i--) {
+        const c = cands[i]!;
+        if (!trusted.has(c.ev.pubkey) || c.body.updatedAt > c.ev.created_at + FUTURE_SKEW) continue;
+        accepted = c; cur = { epoch: c.body.epoch, updatedAt: c.body.updatedAt, id: c.ev.id };
+        this.confirmed.set(c.body.epoch, c.key); trusted = new Set(this.admins(c.body)); startIdx = i + 1;
+        break;
+      }
+    }
+    for (const c of cands.slice(startIdx)) {
+      if (c.body.updatedAt > c.ev.created_at + FUTURE_SKEW) continue;
+      if (cur && c.ev.id === cur.id) { accepted = c; trusted = new Set(this.admins(c.body)); this.confirmed.set(c.body.epoch, c.key); continue; }
       if (!trusted.has(c.ev.pubkey)) continue;
+      if (cur && (c.body.epoch < cur.epoch || (c.body.epoch === cur.epoch && c.body.updatedAt <= cur.updatedAt))) continue;
       accepted = c;
+      cur = { epoch: c.body.epoch, updatedAt: c.body.updatedAt, id: c.ev.id };
       this.confirmed.set(c.body.epoch, c.key);
       trusted = new Set(this.admins(c.body));
     }
@@ -281,8 +386,9 @@ export class Bucket {
       this.name = accepted.body.name;
       this.relays = accepted.body.relays?.length ? accepted.body.relays : this.relays;
       this.st.trusted = [...trusted];
-      maxSeenEpochTrusted = accepted.body.epoch;
+      this.st.acc = { id: accepted.ev.id, epoch: accepted.body.epoch, updatedAt: accepted.body.updatedAt, admins: [...trusted] };
     }
+    const maxSeenEpochTrusted = accepted ? accepted.body.epoch : -1;
     // newer roster signed by a trusted admin that we can't decrypt → locked out
     this.lockedOut = undecryptable.some((ev) => trusted.has(ev.pubkey) && Number(tagVal(ev, "epoch")) > maxSeenEpochTrusted);
 
@@ -294,21 +400,21 @@ export class Bucket {
       if (tagVal(ev, "d") !== blind(this.loc, "devices/" + ev.pubkey)) continue;
       const prev = this.deviceLists.get(ev.pubkey);
       if (prev && prev.at >= ev.created_at) continue;
-      const d = this.tryDecrypt(Number(tagVal(ev, "epoch")), ev.content);
+      const d = this.tryDecrypt(Number(tagVal(ev, "epoch")), ev.content, undefined, true);
       if (!d) continue;
       try {
         const devices = (JSON.parse(d.text) as { devices: DeviceInfo[] }).devices;
-        if (Array.isArray(devices)) this.deviceLists.set(ev.pubkey, { at: ev.created_at, devices });
+        if (Array.isArray(devices)) this.deviceLists.set(ev.pubkey, { at: ev.created_at, devices: devices.filter((x) => x && typeof x.pk === "string") });
       } catch { /* ignore */ }
     }
-
     // joins
     this.joins.clear();
     this.latestJoinAt.clear();
     for (const ev of this.control.values()) {
       if (ev.kind !== KIND_JOIN) continue;
+      if (ev.created_at > now() + FUTURE_SKEW) continue;
       this.latestJoinAt.set(ev.pubkey, Math.max(this.latestJoinAt.get(ev.pubkey) ?? 0, ev.created_at));
-      const info: JoinInfo = { ev, pk: ev.pubkey, createdAt: ev.created_at };
+      const info: JoinInfo = { ev, pk: ev.pubkey, createdAt: ev.created_at, seenAt: this.st.joinSeen?.[ev.id] ?? ev.created_at };
       const x = tagVal(ev, "x");
       if (x) {
         const d = this.tryDecrypt(Number(tagVal(ev, "epoch")), x);
@@ -331,6 +437,9 @@ export class Bucket {
         const inv = this.roster.invites.find((i) => i.id === j.inviteId);
         if (!inv || inv.revoked) continue;
         if (inv.expiresAt && j.createdAt > inv.expiresAt) continue;
+        if (j.createdAt < inv.createdAt) continue; // backdated before the invite existed
+        // SECURITY (M6): an admin only honours joins it first saw before expiry (created_at is signer-controlled)
+        if (inv.expiresAt && this.isAdmin() && j.seenAt > inv.expiresAt && !(inv.usedBy ?? []).includes(j.pk)) continue;
         if (!verifyTokenProof(inv.tokenPk, this.bucketId, j.pk, j.tokenSig)) continue;
         const l = byInvite.get(inv.id) ?? [];
         l.push(j);
@@ -338,7 +447,9 @@ export class Bucket {
       }
       for (const [id, list] of byInvite) {
         const inv = this.roster.invites.find((i) => i.id === id)!;
-        list.sort((a, b) => a.createdAt - b.createdAt || (a.ev.id < b.ev.id ? -1 : 1));
+        // SECURITY (M7): admin orders by local first-seen time, not signer-controlled created_at
+        const admin = this.isAdmin();
+        list.sort((a, b) => (admin ? a.seenAt - b.seenAt : 0) || a.createdAt - b.createdAt || (a.ev.id < b.ev.id ? -1 : 1));
         if (inv.singleUse) {
           const used = inv.usedBy ?? [];
           const winner = used.length ? list.find((j) => used.includes(j.pk)) : list[0];
@@ -347,14 +458,56 @@ export class Bucket {
       }
     }
 
+    // SECURITY (L10): a device pk claimed by more than one member (or by a member identity itself) is invalid for all.
+    this.contested.clear();
+    const claims = new Map<Hex, number>();
+    for (const [owner, { devices }] of this.deviceLists) {
+      if (!this.isOwnerCandidate(owner)) continue;
+      for (const pk of new Set(devices.map((x) => x.pk))) claims.set(pk, (claims.get(pk) ?? 0) + 1);
+    }
+    for (const [pk, c] of claims) if (c > 1 || this.roster?.members.some((m) => m.pk === pk)) this.contested.add(pk);
+
     // who am I acting for?
     if (this.roster?.members.some((m) => m.pk === this.identity.pk) || this.joins.has(this.identity.pk)) this.memberPk = this.identity.pk;
     else {
       this.memberPk = null;
       for (const [member, { devices }] of this.deviceLists) {
+        if (!this.isOwnerCandidate(member) || this.contested.has(this.identity.pk)) continue;
         if (devices.some((d) => d.pk === this.identity.pk && !d.revoked)) { this.memberPk = member; break; }
       }
     }
+    // SECURITY (C3): once converted to a member, drop the invite token key
+    if (this.st.tokenSk && this.memberPk === this.identity.pk && this.roster?.members.some((m) => m.pk === this.identity.pk)) delete this.st.tokenSk;
+
+    // SECURITY (H4): cutoffs (accepted-version sets of removed members / revoked devices)
+    this.cutoffs.clear();
+    for (const c of this.roster?.cutoffs ?? []) {
+      const chunks = new Map<number, Hex[]>();
+      let total = -1;
+      for (const ev of this.control.values()) {
+        if (ev.kind !== KIND_CUTOFF || tagVal(ev, "cut") !== c.id || (c.by && ev.pubkey !== c.by)) continue;
+        const t = ev.tags.find((x) => x[0] === "cut")!;
+        const i = Number(t[2]), tot = Number(t[3]);
+        const d = this.tryDecrypt(Number(tagVal(ev, "epoch")), ev.content);
+        if (!d) continue;
+        try { const ids = JSON.parse(d.text).ids; if (Array.isArray(ids)) { chunks.set(i, ids.map(String)); total = tot; } } catch { /* ignore */ }
+      }
+      let ids: Hex[] | null = null;
+      if (c.count === 0) ids = [];
+      else if (total > 0 && chunks.size === total) {
+        const all: Hex[] = [];
+        for (let i = 0; i < total; i++) all.push(...(chunks.get(i) ?? []));
+        if (sha256Hex(all.join(",")) === c.h) ids = all;
+      }
+      this.cutoffs.set(c.pk, ids ? new Set(ids) : null);
+    }
+  }
+
+  /** A device owner must be a current member (or a valid, unremoved invite-joiner). */
+  private isOwnerCandidate(pk: Hex): boolean {
+    if (!this.roster) return false;
+    if (this.roster.members.some((m) => m.pk === pk)) return true;
+    return this.validJoins.has(pk) && !this.isRemoved(pk);
   }
 
   // ---------- ingest pipeline ----------
@@ -376,17 +529,21 @@ export class Bucket {
           const u = unwrapGrant(ev, sk, pk);
           if (u && u.grant.bucketId === this.bucketId) { if (this.mergeGrant(u.grant, u.sender)) controlChanged = true; }
         }
-      } else if (ev.kind === KIND_ROSTER || ev.kind === KIND_DEVICES || ev.kind === KIND_JOIN) {
+      } else if (ev.kind === KIND_ROSTER || ev.kind === KIND_DEVICES || ev.kind === KIND_JOIN || ev.kind === KIND_CUTOFF) {
         if (this.control.has(ev.id) || tagVal(ev, "g") !== this.g) continue;
+        if (ev.content.length > 200_000) continue;
+        if (ev.kind === KIND_JOIN && !this.acceptJoinSlot(ev)) continue;
         if (!verifyEvent(ev)) continue;
+        if (ev.kind === KIND_JOIN) this.st.joinSeen![ev.id] = Math.max(now(), ev.created_at);
         this.control.set(ev.id, ev);
         ctlRecords.push([this.prefix + "c/" + ev.id, ev]);
         raw.push(ev);
         controlChanged = true;
       } else if (ev.kind === KIND_ENTRY || ev.kind === KIND_SNAPSHOT) {
         if (this.seenOuter.has(ev.id) || this.pending.has(ev.id) || tagVal(ev, "g") !== this.g) continue;
+        // SECURITY (H5): verify before storing anything
+        if (ev.content.length > 200_000 || !verifyEvent(ev)) { this.seenOuter.add(ev.id); continue; }
         entryEvents.push(ev);
-        raw.push(ev);
       }
     }
     if (raw.length) await this.store.putEvents(raw);
@@ -397,22 +554,33 @@ export class Bucket {
     const run = (list: Event[]) => {
       for (const ev of list) {
         const res = this.processOuter(ev, touched, records);
-        if (res === "pending") { if (this.pending.size < MAX_PENDING) this.pending.set(ev.id, ev); }
-        else { this.pending.delete(ev.id); this.seenOuter.add(ev.id); }
+        if (res === "ok" || res === "pending") storeRaw.push(ev);
+        if (res === "pending") { if (this.addPending(ev)) records.push([this.prefix + "p/" + ev.id, ev]); }
+        else {
+          if (this.dropPending(ev.id)) dropped.push(this.prefix + "p/" + ev.id);
+          if (res !== "retry") this.seenOuter.add(ev.id);
+        }
       }
     };
+    const dropped: string[] = [];
+    const storeRaw: Event[] = [];
+    if (controlChanged) this.applyCutoffs(touched, dropped);
     // snapshots last so live versions take their outer ids first
     run(entryEvents.filter((e) => e.kind === KIND_ENTRY));
     run(entryEvents.filter((e) => e.kind === KIND_SNAPSHOT));
     if ((controlChanged || touched.size) && this.pending.size) run([...this.pending.values()]);
 
-    for (const id of touched) { const e = this.graph.get(id); if (e) this.index.update(e); }
+    for (const id of touched) { const e = this.graph.get(id); if (e) this.index.update(e); else this.index.discard(id); }
 
     let changed = controlChanged || touched.size > 0;
+    if (storeRaw.length) await this.store.putEvents(storeRaw);
     await this.persist(records);
+    for (const k of dropped) await this.store.delete(k);
     if (controlChanged) {
       if (await this.autoConvertJoins()) changed = true;
+      if (await this.autoActOnRevokedDevices()) changed = true;
       await this.rewrapToMyDevices();
+      await this.ensureSelfWrap();
     }
     if (changed) this.notify();
     return changed;
@@ -434,34 +602,66 @@ export class Bucket {
     return out;
   }
 
+  /**
+   * SECURITY (C1/C2): a grant's keys are trusted only if the sender is this identity, an admin of the accepted
+   * roster (root admin from adminHint/invite as bootstrap) or — for a device — its bound owner. Anything else is
+   * quarantined: those keys may only decrypt signature-authenticated control events (rosters / device lists),
+   * and are promoted once the sender becomes trusted. Grants never vouch admins.
+   */
   private mergeGrant(grant: KeyGrant, sender: Hex): boolean {
     let changed = false;
-    for (const { n, key } of grant.epochs ?? []) {
-      try { if (this.addKey(n, hexToBytes(key))) changed = true; } catch { /* bad hex */ }
+    const epochs = (grant.epochs ?? []).filter((e) => Number.isInteger(e?.n) && e.n >= 0 && typeof e.key === "string" && /^[0-9a-f]{64}$/.test(e.key));
+    if (sender === this.identity.pk && !this.st.rootAdmins.length && !this.st.acc && Array.isArray(grant.admins)) {
+      this.st.rootAdmins = grant.admins.filter((a) => typeof a === "string"); // self-signed: written by our own client
     }
-    if (grant.rootSecret && !this.st.rootSecret) { this.st.rootSecret = grant.rootSecret; changed = true; }
-    const admins = grant.admins ?? [];
-    if (!this.st.rootAdmins.length) {
-      this.st.rootAdmins = admins.includes(sender) ? [sender] : [...admins];
-    } else if (this.st.rootAdmins.includes(sender) || this.st.trusted.includes(sender)) {
-      // a trusted admin vouches for the current admin set (rosters are addressable, so history may be gone)
-      for (const a of admins) if (!this.st.trusted.includes(a)) this.st.trusted.push(a);
+    const trusted = sender === this.identity.pk || this.trustedAdmins().has(sender) ||
+      (this.memberPk !== null && this.memberPk !== this.identity.pk && sender === this.memberPk);
+    if (trusted) {
+      for (const { n, key } of epochs) if (this.addKey(n, hexToBytes(key))) changed = true;
+      if (grant.rootSecret && !this.st.rootSecret) { this.st.rootSecret = grant.rootSecret; changed = true; }
+    } else {
+      const q = this.st.qgrants!;
+      if (!q[sender] && Object.keys(q).length >= MAX_QUARANTINE_SENDERS) return false;
+      const list = q[sender] ?? [];
+      for (const e of epochs.slice(0, 64)) if (!list.some((x) => x.n === e.n && x.key === e.key) && list.length < 256) { list.push({ n: e.n, key: e.key }); changed = true; }
+      q[sender] = list;
     }
-    if (!this.roster) {
+    if (!this.roster && trusted) {
       if (!this.name && grant.name) this.name = grant.name;
       if (grant.relays?.length && !this.relays.length) this.relays = grant.relays;
     }
     return changed;
   }
 
+  /** SECURITY (H5): bound join events per pubkey and in total. */
+  private acceptJoinSlot(ev: Event): boolean {
+    if (ev.created_at > now() + FUTURE_SKEW) return false;
+    let total = 0, mine = 0;
+    for (const e of this.control.values()) if (e.kind === KIND_JOIN) { total++; if (e.pubkey === ev.pubkey) mine++; }
+    return total < MAX_JOINS && mine < MAX_JOINS_PER_PK;
+  }
+
+  /** SECURITY (H4): drop already-ingested versions not in an author's accepted-version cutoff set. */
+  private applyCutoffs(touched: Set<string>, dropped: string[]) {
+    for (const [pk, ids] of this.cutoffs) {
+      if (!ids) continue;
+      for (const v of this.graph.versionsBy(pk)) {
+        if (ids.has(v.id)) continue;
+        this.graph.remove(v.id);
+        touched.add(v.entryId);
+        dropped.push(this.prefix + "v/" + v.id);
+      }
+    }
+  }
+
   private processOuter(ev: Event, touched: Set<string>, records: [string, unknown][]): ProcessResult {
     const n = Number(tagVal(ev, "epoch"));
     const nonce = tagVal(ev, "n");
-    if (!Number.isInteger(n) || !nonce) return "invalid";
-    if (!this.keys.has(n)) return "pending";
-    if (!verifyEvent(ev)) return "invalid";
+    if (!Number.isInteger(n) || n < 0 || !nonce) return "invalid";
+    // SECURITY (H5): queue only for the next epoch we may plausibly receive a key for
+    if (!this.keys.has(n)) return n <= Math.max(this.epoch, this.maxKeyEpoch()) + 1 ? "pending" : "retry";
     const d = this.tryDecrypt(n, ev.content, (key) => getPublicKey(ephemeralKey(key, nonce)) === ev.pubkey);
-    if (!d) return "pending";
+    if (!d) return "invalid";
     try {
       if (ev.kind === KIND_ENTRY) return this.processInner(JSON.parse(d.text), n, ev.id, touched, records);
       const snap = JSON.parse(d.text) as { entries: Event[] };
@@ -484,6 +684,13 @@ export class Bucket {
     if (body.type !== "fact" && body.type !== "page") return "invalid";
     const member = this.resolveAuthor(inner.pubkey, inner.created_at);
     if (!member) return "pending";
+    // SECURITY (H4): removed member / revoked device: only versions in the admin-published accepted set
+    for (const pk of [inner.pubkey, member]) {
+      if (!this.cutoffs.has(pk)) continue;
+      const ids = this.cutoffs.get(pk);
+      if (!ids) return "pending";
+      if (!ids.has(inner.id)) return "invalid";
+    }
     if (!this.isValidAuthorAt(member, epoch, inner.created_at)) return this.isRemoved(member) ? "invalid" : "pending";
     const v: EntryVersion = {
       entryId: body.entryId, type: body.type, title: String(body.title ?? ""), body: String(body.body ?? ""),
@@ -580,9 +787,44 @@ export class Bucket {
     if (!opts.offline) {
       try { await b.sync(); } catch (e) { if (!b.keys.size) throw e; }
     }
+    if (!b.st.rootAdmins.length && !b.st.acc) {
+      throw new Error("admin pubkey required: pass adminHint (the bucket admin's pubkey, e.g. from the connection string tribe://<bucketId>?admin=<pk>)");
+    }
     if (!b.keys.size) throw new Error("no access: no key grant found for this identity");
     if (!b.roster) throw new Error("bucket roster not found");
+    await b.mutex.run(() => b.ensureSelfWrap());
     return b;
+  }
+
+  /**
+   * SECURITY (C2): members publish a gift wrap to themselves carrying the admin set they trust, so a fresh client of
+   * the same identity bootstraps its trust anchor from a self-signed grant (unforgeable by others).
+   */
+  private async ensureSelfWrap() {
+    if (this.st.selfWrapped || this.memberPk !== this.identity.pk || !this.roster?.members.some((m) => m.pk === this.identity.pk)) return;
+    try {
+      const g = this.grantFor(false);
+      // anchor = root admins (bucket creator / inviting admin), not the current admin set
+      await this.publish(wrapGrant({ ...g, admins: [...this.st.rootAdmins] }, this.identity.sk, this.identity.pk));
+      this.st.selfWrapped = true;
+      await this.persist();
+    } catch { /* best effort */ }
+  }
+
+  /** ADDITION (security): outcome of joining via invite: accepted (in roster), pending (awaiting an admin), rejected. */
+  joinStatus(): "accepted" | "pending" | "rejected" {
+    const pk = this.memberPk ?? this.identity.pk;
+    if (this.roster && !this.lockedOut && this.roster.members.some((m) => m.pk === pk)) return "accepted";
+    if (this.lockedOut || this.isRemoved(this.identity.pk)) return "rejected";
+    const inv = this.st.joinedVia ? this.roster?.invites.find((i) => i.id === this.st.joinedVia) : undefined;
+    if (inv) {
+      if (inv.revoked) return "rejected";
+      if (inv.singleUse && inv.usedBy?.length && !inv.usedBy.includes(this.identity.pk)) return "rejected";
+      if (!this.validJoins.has(this.identity.pk)) {
+        if (inv.expiresAt && now() > inv.expiresAt) return "rejected";
+      }
+    }
+    return "pending";
   }
 
   static async joinWithInvite(opts: { identity: Identity; link: string; name?: string; pool: RelayPool; store: Store }): Promise<Bucket> {
@@ -593,7 +835,7 @@ export class Bucket {
     if (!b.st.rootAdmins.includes(inv.adminPk)) b.st.rootAdmins.push(inv.adminPk);
     b.st.tokenSk = inv.tokenSk;
     await b.sync();
-    if (b.memberPk === identity.pk && b.myRole()) return b; // already in
+    if (b.memberPk === identity.pk && b.myRole()) { await b.mutex.run(() => b.ensureSelfWrap()); return b; } // already in
     const tokenPk = getPublicKey(hexToBytes(inv.tokenSk));
     if (b.lockedOut) throw new Error("invite has been revoked or expired");
     if (!b.keys.size || !b.roster) throw new Error("invite not found (no key grant for this token)");
@@ -610,6 +852,7 @@ export class Bucket {
       tags: [["g", b.g], ["p", inv.adminPk], ["epoch", String(ep)], ["x", x]],
       content: nip44.v2.encrypt(JSON.stringify(req), nip44.getConversationKey(identity.sk, inv.adminPk)),
     });
+    b.st.joinedVia = invite.id;
     await b.mutex.run(() => b.publishAndApply(ev));
     if (!b.validJoins.has(identity.pk) && !b.roster?.members.some((m) => m.pk === identity.pk)) {
       throw new Error("invite already used");
@@ -659,7 +902,7 @@ export class Bucket {
     const startedAt = now();
     const filters: Filter[] = [
       { kinds: [KIND_WRAP], "#p": recips, ...(ws ? { since: ws } : {}) },
-      { kinds: [KIND_ROSTER, KIND_DEVICES], "#g": [this.g] },
+      { kinds: [KIND_ROSTER, KIND_DEVICES, KIND_CUTOFF], "#g": [this.g] },
       { kinds: [KIND_JOIN, KIND_ENTRY, KIND_SNAPSHOT], "#g": [this.g], ...(s ? { since: s } : {}) },
     ];
     const relaysBefore = this.relays.join(",");
@@ -688,7 +931,7 @@ export class Bucket {
     const recips = this.recipientKeys().map(([, pk]) => pk);
     const t = now();
     const filters: Filter[] = [
-      { kinds: [KIND_ENTRY, KIND_SNAPSHOT, KIND_JOIN, KIND_ROSTER, KIND_DEVICES], "#g": [this.g], since: t - 60 },
+      { kinds: [KIND_ENTRY, KIND_SNAPSHOT, KIND_JOIN, KIND_ROSTER, KIND_DEVICES, KIND_CUTOFF], "#g": [this.g], since: t - 60 },
       { kinds: [KIND_WRAP], "#p": recips, since: t - WRAP_OVERLAP },
     ];
     let buf: Event[] = [];
@@ -787,7 +1030,13 @@ export class Bucket {
   private async autoConvertJoins(): Promise<boolean> {
     if (!this.isAdmin() || !this.roster) return false;
     const toAdd = [...this.validJoins.values()].filter((j) => !this.roster!.members.some((m) => m.pk === j.pk) && !this.isRemoved(j.pk));
-    if (!toAdd.length) return false;
+    if (!toAdd.length) {
+      const t = now();
+      if (!this.roster.invites.some((i) => i.expiresAt && i.expiresAt < t && !i.revoked)) return false;
+      // SECURITY (M6): expired invites are revoked + rotated (token holders lose access to future data)
+      await this._rotate((r) => { for (const i of r.invites) if (i.expiresAt && i.expiresAt < t) i.revoked = true; });
+      return true;
+    }
     await this.publishRoster((r) => {
       for (const j of toAdd) {
         r.members.push({ pk: j.pk, role: "member", addedAt: j.createdAt, addedBy: this.identity.pk, viaInvite: j.inviteId, ...(j.name ? { name: j.name } : {}) });
@@ -797,6 +1046,13 @@ export class Bucket {
     });
     // give converted members a grant to their own identity (so they can open from other devices without the token)
     for (const j of toAdd) { try { await this.sendGrant(j.pk, false); } catch { /* best effort */ } }
+    // SECURITY (M6/M7/C3): a consumed single-use or expiring invite token still holds the current epoch key → rotate
+    // so the token (possibly leaked) cannot read anything written from now on.
+    const t = now();
+    if (toAdd.some((j) => { const inv = this.roster!.invites.find((i) => i.id === j.inviteId); return inv && (inv.singleUse || inv.expiresAt); }) ||
+        this.roster.invites.some((i) => i.expiresAt && i.expiresAt < t && !i.revoked)) {
+      await this._rotate((r) => { for (const i of r.invites) if (i.expiresAt && i.expiresAt < t) i.revoked = true; });
+    }
     return true;
   }
 
@@ -805,11 +1061,46 @@ export class Bucket {
       this.requireAdmin();
       if (!this.roster!.members.some((m) => m.pk === pk) && !this.validJoins.has(pk)) throw new Error("not a member");
       if (pk === this.identity.pk && this.admins().length === 1) throw new Error("cannot remove the last admin");
+      const viaInvite = this.roster!.members.find((m) => m.pk === pk)?.viaInvite ?? this.validJoins.get(pk)?.inviteId;
+      const cuts = await this.publishCutoffs([pk]);
       await this._rotate((r, n) => {
         r.members = r.members.filter((m) => m.pk !== pk);
         r.removed = [...(r.removed ?? []), { pk, epoch: n, at: now() }];
+        // SECURITY (C3): the invite token they joined with must not keep receiving keys
+        const inv = viaInvite ? r.invites.find((i) => i.id === viaInvite) : undefined;
+        if (inv && !inv.singleUse) inv.revoked = true;
+        r.cutoffs = mergeCutoffs(r.cutoffs, cuts);
       });
     });
+  }
+
+  /**
+   * SECURITY (H4): publish, per author, the sorted ids of every version we accepted from it (member: incl. its devices).
+   * Chunked like snapshots (~64 ids * 65 chars ≈ 4KB per 60 ids → 700 ids/chunk ≈ 46KB) and committed by hash in the roster.
+   */
+  private async publishCutoffs(pks: Hex[]): Promise<Cutoff[]> {
+    const out: Cutoff[] = [];
+    const n = this.epoch, key = this.keyFor(n);
+    for (const pk of pks) {
+      const ids = [...new Set(this.graph.versionsBy(pk).map((v) => v.id))].sort();
+      const id = randomHex(8);
+      const PER = 600; // ~40KB plaintext → ~54KB encrypted per chunk
+      const total = Math.max(1, Math.ceil(ids.length / PER));
+      if (ids.length) {
+        for (let i = 0; i < total; i++) {
+          const ev = this.identity.sign({
+            kind: KIND_CUTOFF, created_at: now(),
+            tags: [["g", this.g], ["epoch", String(n)], ["cut", id, String(i), String(total)]],
+            content: symEncrypt(key, JSON.stringify({ ids: ids.slice(i * PER, (i + 1) * PER) })),
+          });
+          await this.publish(ev);
+          this.control.set(ev.id, ev);
+          await this.store.set(this.prefix + "c/" + ev.id, ev);
+        }
+      }
+      out.push({ pk, id, count: ids.length, h: sha256Hex(ids.join(",")), by: this.identity.pk });
+    }
+    return out;
   }
 
   async setRole(pk: Hex, role: Role): Promise<void> {
@@ -924,8 +1215,35 @@ export class Bucket {
       if (!list.some((d) => d.pk === pk)) throw new Error("unknown device");
       await this.publishDevices(list);
       delete this.st.deviceWrapped[pk];
-      if (this.isAdmin()) await this._rotate(() => {});
+      // SECURITY (H4): admins rotate + publish a cutoff now; for a non-admin owner, the revoked entry in the device
+      // list IS the rotation request: any admin client auto-acts on it (autoActOnRevokedDevices) when it next syncs.
+      if (this.isAdmin()) await this.rotateForRevokedDevices([{ owner: this.identity.pk, pk }]);
     });
+  }
+
+  /** ADDITION (security): revoked devices whose owner is a member and that the roster has no cutoff for yet. */
+  pendingDeviceRevocations(): { owner: Hex; pk: Hex }[] {
+    const out: { owner: Hex; pk: Hex }[] = [];
+    if (!this.roster) return out;
+    const have = new Set((this.roster.cutoffs ?? []).map((c) => c.pk));
+    for (const [owner, { devices }] of this.deviceLists) {
+      if (!this.roster.members.some((m) => m.pk === owner)) continue;
+      for (const d of devices) if (d.revoked && !have.has(d.pk)) out.push({ owner, pk: d.pk });
+    }
+    return out;
+  }
+
+  private async rotateForRevokedDevices(list: { owner: Hex; pk: Hex }[]) {
+    // cutoff = versions by that device key accepted so far (resolveAuthor already rejects writes after revokedAt)
+    const cuts = await this.publishCutoffs(list.map((x) => x.pk));
+    await this._rotate((r) => { r.cutoffs = mergeCutoffs(r.cutoffs, cuts); });
+  }
+
+  private async autoActOnRevokedDevices(): Promise<boolean> {
+    if (!this.isAdmin()) return false;
+    const todo = this.pendingDeviceRevocations();
+    if (!todo.length) return false;
+    try { await this.rotateForRevokedDevices(todo); return true; } catch { return false; }
   }
 
   private async rewrapToMyDevices() {
@@ -1088,15 +1406,22 @@ export class Bucket {
   }
 }
 
+function mergeCutoffs(a: Cutoff[] | undefined, b: Cutoff[]): Cutoff[] {
+  const m = new Map<Hex, Cutoff>();
+  for (const c of a ?? []) m.set(c.pk, c);
+  for (const c of b) m.set(c.pk, c);
+  return [...m.values()];
+}
+
 function rank(kind: number) {
-  return kind === KIND_WRAP ? 0 : kind === KIND_ROSTER ? 1 : kind === KIND_DEVICES ? 2 : kind === KIND_JOIN ? 3 : 4;
+  return kind === KIND_WRAP ? 0 : kind === KIND_ROSTER ? 1 : kind === KIND_DEVICES || kind === KIND_CUTOFF ? 2 : kind === KIND_JOIN ? 3 : 4;
 }
 function pick(o: any): Partial<JoinInfo> {
   const out: Partial<JoinInfo> = {};
-  if (typeof o?.inviteId === "string") out.inviteId = o.inviteId;
-  if (typeof o?.tokenSig === "string") out.tokenSig = o.tokenSig;
-  if (typeof o?.name === "string") out.name = o.name;
-  if (typeof o?.message === "string") out.message = o.message;
+  if (typeof o?.inviteId === "string" && o.inviteId.length <= 64) out.inviteId = o.inviteId;
+  if (typeof o?.tokenSig === "string" && o.tokenSig.length <= 128) out.tokenSig = o.tokenSig;
+  if (typeof o?.name === "string") out.name = o.name.slice(0, MAX_JOIN_NAME);
+  if (typeof o?.message === "string") out.message = o.message.slice(0, MAX_JOIN_MESSAGE);
   return out;
 }
 

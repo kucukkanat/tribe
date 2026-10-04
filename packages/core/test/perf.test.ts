@@ -44,7 +44,7 @@ test("2k entries through full crypto + member sync", async () => {
   const t0 = performance.now();
   for (let i = 0; i < 2000; i++) await A.write({ type: "fact", title: `f${i} ${rnd(i, 2)}`, body: rnd(i, 30), tags: [WORDS[i % 5]!] });
   const t1 = performance.now();
-  const fresh = await Bucket.open({ identity: B.identity, bucketId: B.bucketId, pool, store: new MemoryStore(), relays: A.relays });
+  const fresh = await Bucket.open({ identity: B.identity, bucketId: B.bucketId, pool, store: new MemoryStore(), relays: A.relays, adminHint: A.identity.pk });
   const t2 = performance.now();
   expect(fresh.entries().length).toBe(2000);
   // incremental sync: nothing new → fast

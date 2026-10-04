@@ -10,7 +10,14 @@ export interface RosterBody {
   removed?: RemovedMember[];
   /** ADDITION: access requests the admin denied (no rotation). A later request (createdAt > at) shows up again. */
   denied?: DeniedRequest[];
+  /**
+   * ADDITION (security): accepted-version cutoffs for removed members / revoked devices. Once present, clients accept
+   * versions authored by `pk` (member: incl. its devices) only if their inner id is in the set published in `count`
+   * ids across kind 4454 chunk events tagged ["cut", id, i, total]; `h` = sha256hex(ids.join(",")).
+   */
+  cutoffs?: Cutoff[];
 }
+export interface Cutoff { pk: Hex; id: string; count: number; h: Hex; /** admin who published the chunks */ by?: Hex }
 export interface DeniedRequest { pk: Hex; at: number }
 export interface KeyGrant { // rumor kind 4459 content
   bucketId: Hex; name: string; relays: string[]; admins: Hex[];
@@ -44,4 +51,5 @@ export const KIND_JOIN = 4451;
 export const KIND_DEVICES = 30451;
 export const KIND_SNAPSHOT = 4452;
 export const KIND_INNER = 4453;
+export const KIND_CUTOFF = 4454;
 export const KIND_TOKEN_PROOF = 4458;

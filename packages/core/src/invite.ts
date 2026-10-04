@@ -2,6 +2,7 @@ import { finalizeEvent, getEventHash, verifyEvent } from "nostr-tools";
 import type { Hex } from "./types.ts";
 import { b64urlDecode, b64urlEncode, hexToBytes, sha256Hex } from "./crypto.ts";
 import { KIND_TOKEN_PROOF } from "./types.ts";
+import { Identity } from "./identity.ts";
 
 export interface InviteLinkData { bucketId: Hex; adminPk: Hex; relays: string[]; tokenSk: Hex; name?: string }
 
@@ -47,4 +48,24 @@ export function verifyTokenProof(tokenPk: Hex, bucketId: Hex, joinerPk: Hex, sig
     const ev = { ...t, id: getEventHash(t), sig };
     return verifyEvent(ev);
   } catch { return false; }
+}
+
+/** Connection string for agents/devices: `tribe://<bucketId>?admin=<pk>&relays=<enc>,<enc>`. */
+export interface ConnectData { bucketId: Hex; adminPk: Hex; relays: string[] }
+export function buildConnectString(d: ConnectData): string {
+  return `tribe://${d.bucketId}?admin=${d.adminPk}&relays=${d.relays.map(encodeURIComponent).join(",")}`;
+}
+export function parseConnectString(s: string): ConnectData {
+  const m = /^tribe:\/\/([0-9a-fA-F]{8,128})\?(.*)$/.exec(s.trim());
+  if (!m) throw new Error("invalid connection string (expected tribe://<bucketId>?admin=<pk>&relays=...)");
+  let adminPk = "", relays: string[] = [];
+  for (const part of m[2]!.split("&")) {
+    const i = part.indexOf("=");
+    const k = part.slice(0, i), v = part.slice(i + 1);
+    if (k === "admin") { try { adminPk = Identity.parsePubkey(decodeURIComponent(v)); } catch { adminPk = ""; } }
+    else if (k === "relays") relays = v.split(",").filter(Boolean).map(decodeURIComponent);
+  }
+  if (!/^[0-9a-f]{64}$/.test(adminPk)) throw new Error("invalid connection string: missing/invalid admin pubkey");
+  for (const r of relays) if (!/^wss?:\/\//.test(r)) throw new Error(`invalid relay URL in connection string: ${r}`);
+  return { bucketId: m[1]!.toLowerCase(), adminPk, relays };
 }

@@ -215,20 +215,21 @@ describe("revocation", () => {
     await B.sync();
     expect(B.entries().length).toBe(1);
     const bobPk = B.identity.pk;
+    const e0 = A.epoch; // single-use invite conversions rotate (security fix M7)
     await A.removeMember(bobPk);
-    expect(A.epoch).toBe(1);
+    expect(A.epoch).toBe(e0 + 1);
     expect(A.roster!.members.some((m) => m.pk === bobPk)).toBe(false);
     await A.write({ type: "fact", title: "new secret", body: "after removal" });
     // Carol still in, gets new key
     await C.sync();
-    expect(C.epoch).toBe(1);
+    expect(C.epoch).toBe(e0 + 1);
     expect(C.entries().map((e) => e.head.title).sort()).toEqual(["new secret", "old secret"]);
     const cv = await C.write({ type: "fact", title: "carol post-rotation", body: "x" });
-    expect(cv.epoch).toBe(1);
+    expect(cv.epoch).toBe(e0 + 1);
     expect(cv.authorMember).toBe(cu.id.pk);
     // Bob cannot read new data
     await B.sync();
-    expect(B.epoch).toBe(0);
+    expect(B.epoch).toBe(e0);
     expect(B.lockedOut).toBe(true);
     expect(B.myRole()).toBeNull();
     expect(B.entries().map((e) => e.head.title)).toEqual(["old secret"]);
@@ -287,7 +288,7 @@ describe("devices", () => {
     const agent = Identity.generate();
     await B.addDevice(agent.pk, "claude", "agent");
     expect(B.devices().map((d) => d.pk)).toEqual([agent.pk]);
-    const D = await Bucket.open({ identity: agent, bucketId: A.bucketId, pool, store: new MemoryStore(), relays: RELAYS });
+    const D = await Bucket.open({ identity: agent, bucketId: A.bucketId, pool, store: new MemoryStore(), relays: RELAYS, adminHint: admin.id.pk });
     expect(D.memberPk).toBe(bob.id.pk);
     expect(D.myRole()).toBe("member");
     const v = await D.write({ type: "fact", title: "agent fact", body: "x", source: "agent:claude" });

@@ -26,12 +26,18 @@ Set `TRIBE_HOME` to use a directory other than `~/.tribe`.
 
 ## 2. Pair it
 
-In the Tribe web app: open your bucket → **Devices & Agents → Pair an agent** → paste the npub. This publishes your device list and wraps the bucket's epoch keys to the device.
+In the Tribe web app: open your bucket → **Devices & Agents → Pair an agent** → paste the npub. This publishes your device list and wraps the bucket's epoch keys to the device. The app then shows a **connection string**:
 
-Check it worked (bucket id is shown in the web app under Settings):
+```
+tribe://<bucketId>?admin=<adminPubkey>&relays=wss%3A%2F%2Fnos.lol,wss%3A%2F%2Frelay.primal.net
+```
+
+The `admin` pubkey is the device's **trust anchor**: on first open the agent only accepts keys and rosters that chain back to that admin, so nobody who merely knows the bucket id can feed it a fake bucket. It is required the first time (afterwards it is persisted in the local cache). Equivalent long form: `--bucket <bucketId> --admin <npub|hex> [--relays a,b]`.
+
+Check it worked:
 
 ```sh
-bunx tribe-mcp status --bucket <bucketId>
+bunx tribe-mcp status --connect "tribe://<bucketId>?admin=<pk>&relays=..."
 ```
 
 You should see the bucket name, epoch, the owning member and the entry count. If you see **"Not paired yet"**, the device key has no grant — repeat the pairing step (and make sure you pasted the npub from *this* machine).
@@ -39,7 +45,7 @@ You should see the bucket name, epoch, the owning member and the entry count. If
 ## 3. Serve
 
 ```sh
-bunx tribe-mcp serve --bucket <bucketId> [--relays wss://relay.damus.io,wss://nos.lol]
+bunx tribe-mcp serve --connect "tribe://<bucketId>?admin=<pk>&relays=..."
 ```
 
 The server syncs on start, keeps a live relay subscription (plus a 5-minute resync), and caches decrypted state in `~/.tribe/<bucketId>.json`. Logs go to stderr only.
@@ -67,7 +73,7 @@ Tested against public relays (see `scripts/e2e-real.ts` at the repo root). `rela
   "mcpServers": {
     "tribe": {
       "command": "bunx",
-      "args": ["tribe-mcp", "serve", "--bucket", "<bucketId>"]
+      "args": ["tribe-mcp", "serve", "--connect", "tribe://<bucketId>?admin=<pk>&relays=..."]
     }
   }
 }
@@ -78,7 +84,7 @@ Tested against public relays (see `scripts/e2e-real.ts` at the repo root). `rela
 ### Claude Code
 
 ```sh
-claude mcp add tribe -- bunx tribe-mcp serve --bucket <bucketId>
+claude mcp add tribe -- bunx tribe-mcp serve --connect "tribe://<bucketId>?admin=<pk>&relays=..."
 ```
 
 or in `.mcp.json`:
@@ -86,14 +92,14 @@ or in `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "tribe": { "type": "stdio", "command": "bunx", "args": ["tribe-mcp", "serve", "--bucket", "<bucketId>"] }
+    "tribe": { "type": "stdio", "command": "bunx", "args": ["tribe-mcp", "serve", "--connect", "tribe://<bucketId>?admin=<pk>&relays=..."] }
   }
 }
 ```
 
 ### Any MCP client
 
-Spawn `bunx tribe-mcp serve --bucket <bucketId>` and speak MCP over stdin/stdout. Optional env: `TRIBE_HOME`.
+Spawn `bunx tribe-mcp serve --connect "tribe://..."` and speak MCP over stdin/stdout. Optional env: `TRIBE_HOME`.
 
 From a checkout of this repo, use `bun /path/to/tribe/packages/mcp/src/cli.ts serve …` instead of `bunx tribe-mcp`.
 

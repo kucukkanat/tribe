@@ -14,7 +14,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { Bucket, DEFAULT_RELAYS, Identity, MemoryStore, NostrPool, bytesToHex } from "../packages/core/src/index.ts";
+import { Bucket, DEFAULT_RELAYS, Identity, MemoryStore, NostrPool, bytesToHex, buildConnectString } from "../packages/core/src/index.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const CLI = join(ROOT, "packages/mcp/src/cli.ts");
@@ -119,7 +119,7 @@ async function main() {
   const relayArg = RELAYS.join(",");
   await step("tribe-mcp status shows paired + 4 entries", () =>
     until("status paired", async () => {
-      const r = run(["bun", CLI, "status", "--bucket", A.bucketId, "--relays", relayArg], { TRIBE_HOME: home });
+      const r = run(["bun", CLI, "status", "--connect", buildConnectString({ bucketId: A.bucketId, adminPk: adminId.pk, relays: RELAYS })], { TRIBE_HOME: home });
       if (r.code !== 0) throw new Error((r.out + r.err).trim().split("\n").slice(-2).join(" | "));
       const owner = /Owner\s*:\s*.*\[admin\]/.test(r.out);
       const n = Number(/Entries\s*:\s*(\d+)/.exec(r.out)?.[1] ?? -1);
@@ -131,7 +131,7 @@ async function main() {
       const { Client } = await import("../packages/mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js");
       const { StdioClientTransport } = await import("../packages/mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js");
       const transport = new StdioClientTransport({
-        command: "bun", args: [CLI, "serve", "--bucket", A.bucketId, "--relays", relayArg],
+        command: "bun", args: [CLI, "serve", "--bucket", A.bucketId, "--admin", adminId.npub(), "--relays", relayArg],
         env: { ...(process.env as Record<string, string>), TRIBE_HOME: home }, stderr: "pipe",
       });
       const client = new Client({ name: "e2e-real", version: "0.0.0" });

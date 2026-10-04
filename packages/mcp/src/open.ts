@@ -40,11 +40,11 @@ export interface Opened {
 
 function looksUnpaired(err: unknown): boolean {
   const m = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
-  if (/roster not found/.test(m)) return false; // have keys but no roster: relays unreachable / wrong relays
+  if (/roster not found|admin pubkey required/.test(m)) return false; // have keys but no roster: relays unreachable / wrong relays
   return /grant|not (a )?member|no access|not paired|no key|unauthori[sz]ed|forbidden/.test(m);
 }
 
-export async function openReal(opts: { identity: Identity; bucketId: string; relays?: string[] }): Promise<Opened> {
+export async function openReal(opts: { identity: Identity; bucketId: string; relays?: string[]; adminPk?: string }): Promise<Opened> {
   await ensureWebSocket();
   ensureHome();
   const { FileStore } = await import("@tribe/core/file");
@@ -54,7 +54,8 @@ export async function openReal(opts: { identity: Identity; bucketId: string; rel
   let bucket: Bucket;
   try {
     // Bucket.open syncs from relays itself.
-    bucket = await Bucket.open({ identity: opts.identity, bucketId: opts.bucketId, pool, store, ...(relays ? { relays } : {}) });
+    // adminPk (trust anchor) is required on first open; afterwards it is persisted in the store.
+    bucket = await Bucket.open({ identity: opts.identity, bucketId: opts.bucketId, pool, store, ...(relays ? { relays } : {}), ...(opts.adminPk ? { adminHint: opts.adminPk } : {}) });
   } catch (err) {
     try {
       pool.close?.();

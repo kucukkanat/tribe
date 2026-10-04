@@ -3,18 +3,21 @@ import { parseArgs } from "node:util";
 import { createDevice, devicePath, loadDevice, sanitizeLabel } from "./device.ts";
 import { log } from "./log.ts";
 import { NotPairedError, openMock, openReal, type Opened } from "./open.ts";
-import { findOwner, Identity, memberName } from "./core.ts";
+import { findOwner, Identity, memberName, parseConnectString } from "./core.ts";
 import { SERVER_VERSION, startServer } from "./server.ts";
 
 const USAGE = `tribe-mcp ${SERVER_VERSION} — Tribe encrypted team memory for AI agents (MCP over stdio)
 
 Usage:
   tribe-mcp init [--label <name>] [--force]     Create this machine's device key (~/.tribe/device.json)
-  tribe-mcp status --bucket <id> [--relays a,b]  Check pairing and show bucket info
-  tribe-mcp serve  --bucket <id> [--relays a,b]  Run the MCP server on stdio
+  tribe-mcp status --connect <tribe://...>       Check pairing and show bucket info
+  tribe-mcp serve  --connect <tribe://...>       Run the MCP server on stdio
+  (or: --bucket <id> --admin <npub|hex> [--relays a,b] instead of --connect)
 
 Options:
-  --bucket <id>     Bucket id (hex) — shown in the Tribe web app under Settings
+  --connect <str>   Connection string tribe://<bucketId>?admin=<pk>&relays=... (Tribe web app → Devices & Agents)
+  --bucket <id>     Bucket id (hex)
+  --admin <pk>      Bucket admin pubkey (npub or hex) — the trust anchor; required on first use
   --relays <list>   Comma-separated relay URLs (default: bucket's roster relays)
   --label <name>    Device label; entries are tagged with source "agent:<label>"
   --force           Overwrite an existing device key (init)
@@ -28,6 +31,8 @@ function parse(argv: string[]) {
     strict: true,
     options: {
       bucket: { type: "string", short: "b" },
+      admin: { type: "string", short: "a" },
+      connect: { type: "string", short: "c" },
       relays: { type: "string", short: "r" },
       label: { type: "string", short: "l" },
       force: { type: "boolean" },
@@ -49,8 +54,19 @@ function relaysOf(v?: string): string[] | undefined {
   return list.length ? list : undefined;
 }
 
+function adminOf(v?: string): string | undefined {
+  if (!v) return undefined;
+  const s = v.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return s.toLowerCase();
+  try {
+    return Identity.parsePubkey(s);
+  } catch {
+    throw new Error(`Invalid --admin "${v}": expected an npub or 64-char hex pubkey.`);
+  }
+}
+
 function requireBucket(v?: string): string {
-  if (!v) throw new Error("Missing --bucket <id>. Find the bucket id in the Tribe web app (Settings).");
+  if (!v) throw new Error("Missing --connect <tribe://...> (or --bucket <id> --admin <pk>). Copy it from the Tribe web app → Devices & Agents.");
   if (!/^[0-9a-fA-F]{8,128}$/.test(v)) throw new Error(`Invalid --bucket "${v}": expected a hex bucket id.`);
   return v.toLowerCase();
 }
@@ -71,7 +87,7 @@ async function cmdInit(values: ReturnType<typeof parse>["values"]) {
   out("  1. Open the Tribe web app and select your bucket.");
   out("  2. Go to Devices & Agents → Pair an agent.");
   out(`  3. Paste this npub: ${identity.npub()}`);
-  out(`  4. Then run: tribe-mcp status --bucket <bucketId>`);
+  out(`  4. Copy the connection string shown there and run: tribe-mcp status --connect "tribe://..."`);
 }
 
 async function openFor(values: ReturnType<typeof parse>["values"]): Promise<Opened & { label: string }> {
@@ -85,10 +101,20 @@ async function openFor(values: ReturnType<typeof parse>["values"]): Promise<Open
     }
     return { ...(await openMock({ identity, label })), label };
   }
-  const bucketId = requireBucket(values.bucket);
+  let bucketId: string, adminPk: string | undefined, relays: string[] | undefined;
+  if (values.connect) {
+    const c = parseConnectString(values.connect);
+    bucketId = c.bucketId;
+    adminPk = c.adminPk;
+    relays = relaysOf(values.relays) ?? (c.relays.length ? c.relays : undefined);
+  } else {
+    bucketId = requireBucket(values.bucket);
+    adminPk = adminOf(values.admin);
+    relays = relaysOf(values.relays);
+  }
   const { device, identity } = loadDevice();
   const label = values.label ? sanitizeLabel(values.label) : device.label;
-  return { ...(await openReal({ identity, bucketId, relays: relaysOf(values.relays) })), label };
+  return { ...(await openReal({ identity, bucketId, relays, adminPk })), label };
 }
 
 async function cmdStatus(values: ReturnType<typeof parse>["values"]) {
