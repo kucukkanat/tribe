@@ -1,7 +1,7 @@
 import { finalizeEvent, getPublicKey, nip44, verifyEvent } from "nostr-tools";
 import type { Event, Filter } from "nostr-tools";
 import { Identity } from "./identity.ts";
-import type { RelayPool } from "./pool.ts";
+import type { RelayPool, RelayStatus } from "./pool.ts";
 import type { Store } from "./store/types.ts";
 import {
   DEFAULT_RELAYS, KIND_DEVICES, KIND_ENTRY, KIND_INNER, KIND_JOIN, KIND_ROSTER, KIND_SNAPSHOT, KIND_WRAP, MAX_BODY_BYTES,
@@ -90,6 +90,7 @@ export class Bucket {
   private lastDevicesAt = 0;
   private deviceLists = new Map<Hex, { at: number; devices: DeviceInfo[] }>();
   private joins = new Map<Hex, JoinInfo>();
+  private latestJoinAt = new Map<Hex, number>();
   private validJoins = new Map<Hex, JoinInfo>();
   private graph = new EntryGraph();
   private index = new SearchIndex();
@@ -97,6 +98,8 @@ export class Bucket {
   private pending = new Map<string, Event>();
   private seenWraps: Set<string>;
   private mutex = new Mutex();
+  private listeners = new Set<() => void>();
+  private notifyScheduled = false;
 
   private constructor(identity: Identity, pool: RelayPool, store: Store, st: PersistState) {
     this.identity = identity;
@@ -238,7 +241,7 @@ export class Bucket {
     for (const [member, { devices }] of this.deviceLists) {
       const d = devices.find((x) => x.pk === authorPk);
       if (!d) continue;
-      if (d.revoked && (d.revokedAt === undefined || createdAt >= d.revokedAt)) return null;
+      if (d.revoked && (d.revokedAt === undefined || createdAt > d.revokedAt)) return null; // same-second writes stay valid (second granularity)
       return member;
     }
     return null;
@@ -301,8 +304,10 @@ export class Bucket {
 
     // joins
     this.joins.clear();
+    this.latestJoinAt.clear();
     for (const ev of this.control.values()) {
       if (ev.kind !== KIND_JOIN) continue;
+      this.latestJoinAt.set(ev.pubkey, Math.max(this.latestJoinAt.get(ev.pubkey) ?? 0, ev.created_at));
       const info: JoinInfo = { ev, pk: ev.pubkey, createdAt: ev.created_at };
       const x = tagVal(ev, "x");
       if (x) {
@@ -409,7 +414,18 @@ export class Bucket {
       if (await this.autoConvertJoins()) changed = true;
       await this.rewrapToMyDevices();
     }
+    if (changed) this.notify();
     return changed;
+  }
+
+  /** Fire live() listeners (coalesced, async so callers holding the mutex are not re-entered). */
+  private notify() {
+    if (!this.listeners.size || this.notifyScheduled) return;
+    this.notifyScheduled = true;
+    setTimeout(() => {
+      this.notifyScheduled = false;
+      for (const l of [...this.listeners]) { try { l(); } catch { /* listener error */ } }
+    }, 0);
   }
 
   private recipientKeys(): [Uint8Array, Hex][] {
@@ -664,6 +680,10 @@ export class Bucket {
     }
   }
 
+  /**
+   * Subscribe for updates. `onChange` fires (coalesced) whenever visible state changes: events from relays,
+   * `sync()`, and local writes / admin actions made through this Bucket instance.
+   */
   live(onChange: () => void): () => void {
     const recips = this.recipientKeys().map(([, pk]) => pk);
     const t = now();
@@ -674,18 +694,26 @@ export class Bucket {
     let buf: Event[] = [];
     let scheduled = false;
     let closed = false;
+    const listener = () => { if (!closed) onChange(); };
+    this.listeners.add(listener);
     const flush = async () => {
       scheduled = false;
       const batch = buf;
       buf = [];
       batch.sort((a, b) => rank(a.kind) - rank(b.kind));
-      try { if ((await this.ingest(batch)) && !closed) onChange(); } catch { /* ignore */ }
+      try { await this.ingest(batch); } catch { /* ignore */ } // ingest notifies listeners on change
     };
     const unsub = this.pool.subscribe(filters, this.relays, (ev) => {
       buf.push(ev);
       if (!scheduled) { scheduled = true; setTimeout(flush, 0); }
     });
-    return () => { closed = true; unsub(); };
+    return () => { closed = true; this.listeners.delete(listener); unsub(); };
+  }
+
+  /** ADDITION: last known per-relay health for this bucket's relays (from the pool's publish/query results). */
+  relayStatus(): RelayStatus[] {
+    const s = this.pool.status?.(this.relays);
+    return s ?? this.relays.map((url) => ({ url, ok: true }));
   }
 
   // ---------- members (admin) ----------
@@ -721,9 +749,25 @@ export class Bucket {
     for (const j of this.joins.values()) {
       if (this.roster.members.some((m) => m.pk === j.pk)) continue;
       if (this.isRemoved(j.pk) && (this.roster.removed ?? []).some((r) => r.pk === j.pk && r.at >= j.createdAt)) continue;
+      const latest = this.latestJoinAt.get(j.pk) ?? j.createdAt;
+      if ((this.roster.denied ?? []).some((d) => d.pk === j.pk && d.at >= latest)) continue;
       out.push({ pk: j.pk, name: j.name, message: j.message, createdAt: j.createdAt, inviteId: j.inviteId, autoAccepted: this.validJoins.has(j.pk) });
     }
     return out.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * ADDITION: deny a pending access request. Recorded in the roster (`denied`) so every client hides it; no rotation.
+   * Invite-based joins are auto-accepted — use removeMember for those.
+   */
+  async deny(pk: Hex): Promise<void> {
+    return this.mutex.run(async () => {
+      this.requireAdmin();
+      if (this.roster!.members.some((m) => m.pk === pk)) throw new Error("already a member (use removeMember)");
+      if (this.validJoins.has(pk)) throw new Error("joined via invite (use removeMember)");
+      const at = Math.max(now(), this.latestJoinAt.get(pk) ?? 0);
+      await this.publishRoster((r) => { r.denied = [...(r.denied ?? []).filter((d) => d.pk !== pk), { pk, at }]; });
+    });
   }
 
   async approve(pk: Hex, role: Role = "member"): Promise<void> {
@@ -731,6 +775,7 @@ export class Bucket {
       this.requireAdmin();
       const j = this.joins.get(pk);
       await this.publishRoster((r) => {
+        if (r.denied) r.denied = r.denied.filter((d) => d.pk !== pk);
         const ex = r.members.find((m) => m.pk === pk);
         if (ex) ex.role = role;
         else r.members.push({ pk, role, addedAt: now(), addedBy: this.identity.pk, ...(j?.name ? { name: j.name } : {}), ...(j?.inviteId && this.validJoins.has(pk) ? { viaInvite: j.inviteId } : {}) });

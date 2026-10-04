@@ -1,21 +1,106 @@
 import { SimplePool, matchFilter } from "nostr-tools";
 import type { Event, Filter } from "nostr-tools";
 
+export interface RelayStatus {
+  url: string;
+  /** false if the most recent operation on this relay failed */
+  ok: boolean;
+  lastError?: string; lastOkAt?: number; lastErrorAt?: number;
+  /** result of the most recent publish / query (undefined = not attempted yet) */
+  write?: boolean; read?: boolean;
+}
+
 export interface RelayPool {
   publish(ev: Event, relays: string[]): Promise<{ ok: string[]; failed: string[] }>;
   subscribe(filters: Filter[], relays: string[], onEvent: (ev: Event) => void, onEose?: () => void): () => void;
   query(filters: Filter[], relays: string[]): Promise<Event[]>;
+  /** ADDITION (optional): last known per-relay health from publish/query results. */
+  status?(relays?: string[]): RelayStatus[];
 }
+
+/** Tracks per-relay health. */
+export class RelayHealth {
+  private m = new Map<string, RelayStatus>();
+  private get(url: string) { let s = this.m.get(url); if (!s) this.m.set(url, (s = { url, ok: true })); return s; }
+  ok(url: string, op?: "read" | "write") {
+    const s = this.get(url);
+    s.ok = true; s.lastOkAt = Date.now();
+    if (op) s[op] = true;
+  }
+  fail(url: string, err: unknown, op?: "read" | "write") {
+    const s = this.get(url);
+    s.ok = false; s.lastError = errMsg(err); s.lastErrorAt = Date.now();
+    if (op) s[op] = false;
+  }
+  list(relays?: string[]): RelayStatus[] {
+    const urls = relays ?? [...this.m.keys()];
+    return urls.map((url) => ({ ...(this.m.get(url) ?? { url, ok: true }) }));
+  }
+}
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e) ?? String(e)).slice(0, 200);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const normUrl = (u: string) => u.replace(/\/+$/, "");
 
 export class NostrPool implements RelayPool {
   readonly pool: SimplePool;
   maxWait: number;
-  constructor(opts?: { pool?: SimplePool; maxWait?: number }) {
-    this.pool = opts?.pool ?? new SimplePool();
+  /** retries per relay for rate-limited / transient publish failures */
+  publishRetries: number;
+  readonly health = new RelayHealth();
+  constructor(opts?: { pool?: SimplePool; maxWait?: number; publishRetries?: number }) {
+    this.pool = opts?.pool ?? new SimplePool({ enablePing: true, enableReconnect: true } as any);
     this.maxWait = opts?.maxWait ?? 4000;
+    this.publishRetries = opts?.publishRetries ?? 2;
+  }
+  /** max in-flight publishes per relay (bursts like rotation wraps trip relay rate limits) */
+  perRelayConcurrency = 3;
+  private inflight = new Map<string, number>();
+  private waiters = new Map<string, (() => void)[]>();
+  private cooldownUntil = new Map<string, number>();
+  private async acquire(url: string) {
+    while ((this.inflight.get(url) ?? 0) >= this.perRelayConcurrency) {
+      await new Promise<void>((r) => { const w = this.waiters.get(url) ?? []; w.push(r); this.waiters.set(url, w); });
+    }
+    this.inflight.set(url, (this.inflight.get(url) ?? 0) + 1);
+    const cd = (this.cooldownUntil.get(url) ?? 0) - Date.now();
+    if (cd > 0) await sleep(cd);
+  }
+  private release(url: string) {
+    this.inflight.set(url, (this.inflight.get(url) ?? 1) - 1);
+    this.waiters.get(url)?.shift()?.();
+  }
+  /** relays that answered "banned"/"blocked" are skipped (fail fast) for this long */
+  banCooldownMs = 60_000;
+  private bannedUntil = new Map<string, { until: number; msg: string }>();
+  private async publishOne(url: string, ev: Event): Promise<void> {
+    const ban = this.bannedUntil.get(url);
+    if (ban && ban.until > Date.now()) { this.health.fail(url, ban.msg, "write"); throw new Error(ban.msg); }
+    await this.acquire(url);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const [p] = this.pool.publish([url], ev, { maxWait: this.maxWait });
+          await p!;
+          this.health.ok(url, "write");
+          return;
+        } catch (e) {
+          const m = errMsg(e);
+          if (/duplicate/i.test(m)) { this.health.ok(url, "write"); return; }
+          const limited = /rate-?limit|too (much|many|fast)|slow down|noting too much/i.test(m);
+          if (limited) this.cooldownUntil.set(url, Date.now() + 1500 * (attempt + 1));
+          const transient = limited || /timed? ?out|connection|closed/i.test(m);
+          if (/banned|blocked/i.test(m)) this.bannedUntil.set(url, { until: Date.now() + this.banCooldownMs, msg: m });
+          if (/banned|blocked|restricted|policy|pow:|auth-required/i.test(m) || !transient || attempt >= this.publishRetries) {
+            this.health.fail(url, e, "write");
+            throw e;
+          }
+          await sleep(limited ? 1500 * (attempt + 1) : 500 * (attempt + 1) + Math.random() * 300);
+        }
+      }
+    } finally { this.release(url); }
   }
   async publish(ev: Event, relays: string[]) {
-    const res = await Promise.allSettled(this.pool.publish(relays, ev, { maxWait: this.maxWait }));
+    const res = await Promise.allSettled(relays.map((u) => this.publishOne(u, ev)));
     const ok: string[] = [], failed: string[] = [];
     res.forEach((r, i) => (r.status === "fulfilled" ? ok : failed).push(relays[i]!));
     return { ok, failed };
@@ -26,16 +111,58 @@ export class NostrPool implements RelayPool {
       this.pool.subscribeMany(relays, f, {
         onevent: onEvent,
         oneose: () => { if (--pending === 0) onEose?.(); },
-      }),
+        onclose: (reasons: { url: string; reason: string }[] | string[]) => {
+          for (const r of reasons as any[]) if (r && typeof r === "object" && r.reason && !/closed by caller/i.test(r.reason)) this.health.fail(r.url, r.reason, "read");
+        },
+      } as any),
     );
     if (filters.length === 0) onEose?.();
     return () => subs.forEach((s) => s.close());
   }
+  /** Per-relay query: each relay gets its own subscription so one slow/broken relay can't stall or hide others. */
   async query(filters: Filter[], relays: string[]): Promise<Event[]> {
-    const all = await Promise.all(filters.map((f) => this.pool.querySync(relays, f, { maxWait: this.maxWait })));
     const seen = new Map<string, Event>();
-    for (const list of all) for (const e of list) seen.set(e.id, e);
+    await Promise.all(relays.map(async (url) => {
+      try {
+        const lists = await Promise.all(filters.map((f) => this.queryRelay(url, f)));
+        for (const list of lists) for (const e of list) seen.set(e.id, e);
+        this.health.ok(url, "read");
+      } catch (e) { this.health.fail(url, e, "read"); }
+    }));
     return [...seen.values()];
+  }
+  private queryRelay(url: string, f: Filter): Promise<Event[]> {
+    return new Promise((resolve, reject) => {
+      const out: Event[] = [];
+      let done = false;
+      const finish = (err?: unknown) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { sub.close(); } catch { /* ignore */ }
+        if (err && !out.length) reject(err); else resolve(out);
+      };
+      // eose may never come from a relay that silently drops the REQ → hard timeout
+      const timer = setTimeout(() => finish(out.length ? undefined : new Error("query timeout (no EOSE)")), this.maxWait + 2000);
+      const sub = this.pool.subscribeMany([url], f, {
+        maxWait: this.maxWait,
+        onevent: (e: Event) => out.push(e),
+        oneose: () => finish(),
+        onclose: (reasons: any) => {
+          const r = Array.isArray(reasons) ? reasons[0] : reasons;
+          const reason = typeof r === "string" ? r : r?.reason;
+          finish(reason && !/closed by caller|eose/i.test(reason) ? new Error(reason) : undefined);
+        },
+      } as any);
+    });
+  }
+  status(relays?: string[]): RelayStatus[] {
+    const conn = this.pool.listConnectionStatus();
+    const byNorm = new Map([...conn].map(([u, v]) => [normUrl(u), v]));
+    return this.health.list(relays).map((s) => {
+      const c = byNorm.get(normUrl(s.url));
+      return c === false && s.ok ? { ...s, ok: false, lastError: s.lastError ?? "disconnected" } : s;
+    });
   }
   close() { this.pool.destroy(); }
 }
@@ -137,6 +264,11 @@ export class MockPool implements RelayPool {
       onEose?.();
     });
     return () => { closed = true; this.subs.delete(sub); };
+  }
+
+  status(relays?: string[]): RelayStatus[] {
+    const urls = relays ?? [...this.relays.keys()];
+    return urls.map((url) => (this.down.has(url) ? { url, ok: false, lastError: "down (mock)" } : { url, ok: true }));
   }
 
   /** Test helper: all events stored on a relay. */

@@ -17,7 +17,7 @@ export class FileStore extends MemoryStore {
   debounceMs: number;
   constructor(path?: string, opts?: { debounceMs?: number }) {
     super();
-    this.path = path ?? join(process.env.TRIBE_HOME ?? join(homedir(), ".tribe"), "store.json");
+    this.path = path ?? join(process.env.TRIBE_HOME || join(homedir(), ".tribe"), "store.json");
     this.debounceMs = opts?.debounceMs ?? 200;
     if (existsSync(this.path)) {
       try {

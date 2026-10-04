@@ -1,11 +1,15 @@
 {
   "name": "tribe",
   "private": true,
-  "workspaces": ["packages/*", "apps/*"],
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "test": "bun test packages/core",
     "build:web": "cd apps/web && bun run build",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "e2e:real": "bun scripts/e2e-real.ts"
   },
   "devDependencies": {
     "bun-types": "^1.4.2",

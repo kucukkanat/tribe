@@ -44,6 +44,20 @@ bunx tribe-mcp serve --bucket <bucketId> [--relays wss://relay.damus.io,wss://no
 
 The server syncs on start, keeps a live relay subscription (plus a 5-minute resync), and caches decrypted state in `~/.tribe/<bucketId>.json`. Logs go to stderr only.
 
+### Local files (`TRIBE_HOME`, default `~/.tribe`)
+
+| File | Written by | Contents |
+|---|---|---|
+| `device.json` | `tribe-mcp init` | device secret key (mode `0600`) + label |
+| `<bucketId>.json` | `tribe-mcp status/serve` | per-bucket cache: raw relay events + decrypted state for this device (one `FileStore` per bucket, as in SPEC) |
+| `store.json` | `@tribe/core/file` default | `new FileStore()` with no path uses a single multi-bucket file so `Bucket.listMine()` sees every bucket; the MCP server never uses it |
+
+Both layouts are the same `FileStore` format; the MCP passes an explicit per-bucket path (`bucketStorePath()` in `src/device.ts`), while core's default (no path) is the single `store.json`. Both honour `TRIBE_HOME`. Deleting a cache file is safe — it is rebuilt from relays on next start.
+
+### Relays
+
+Tested against public relays (see `scripts/e2e-real.ts` at the repo root). `relay.damus.io`, `nos.lol`, `relay.primal.net`, `nostr.mom` and `relay.snort.social` accept all Tribe kinds (30450, 30451, 4450, 4451, 4452, 1059). Notes: `relay.damus.io` accepts kind 1059 gift wraps but does not return them to unauthenticated `#p` queries, and rate-limits bursts — keep at least one other relay in the list. `nos.lol` / `nostr.mom` reject events over ~64 KB (Tribe caps entry bodies at 60 KB, so entries fit).
+
 ### Claude Desktop
 
 `claude_desktop_config.json`:

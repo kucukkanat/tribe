@@ -8,7 +8,10 @@ export interface RosterBody {
   relays: string[]; members: Member[]; invites: Invite[]; updatedAt: number;
   /** ADDITION: removal history so all clients can reject post-removal writes at old epochs. */
   removed?: RemovedMember[];
+  /** ADDITION: access requests the admin denied (no rotation). A later request (createdAt > at) shows up again. */
+  denied?: DeniedRequest[];
 }
+export interface DeniedRequest { pk: Hex; at: number }
 export interface KeyGrant { // rumor kind 4459 content
   bucketId: Hex; name: string; relays: string[]; admins: Hex[];
   epochs: { n: number; key: Hex }[]; rootSecret?: Hex /* only to admins */;

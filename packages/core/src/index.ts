@@ -1,7 +1,7 @@
 export * from "./types.ts";
 export type { Store } from "./store/types.ts";
-export type { RelayPool } from "./pool.ts";
-export { MockPool, NostrPool } from "./pool.ts";
+export type { RelayPool, RelayStatus } from "./pool.ts";
+export { MockPool, NostrPool, RelayHealth } from "./pool.ts";
 export { MemoryStore } from "./store/memory.ts";
 export { Identity } from "./identity.ts";
 export { Bucket } from "./bucket.ts";

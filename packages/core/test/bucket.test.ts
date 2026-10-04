@@ -314,11 +314,88 @@ describe("devices", () => {
     // revoke device: Bob is not admin → mark only; writes after revoke rejected by others
     await B.revokeDevice(agent.pk);
     await tick(1100);
+    // D has NOT synced, so it doesn't know it is revoked: its write succeeds locally and is published …
+    const v3 = await D.write({ type: "fact", title: "revoked agent", body: "z" });
+    expect(D.get(v3.entryId)).toBeDefined();
+    expect(pool.dump().some((e) => e.kind === 4450 && e.created_at >= v3.createdAt)).toBe(true);
+    // … but every other client rejects it (author device revoked before createdAt)
+    await A.sync(); await B.sync();
+    expect(A.get(v3.entryId)).toBeUndefined();
+    expect(B.get(v3.entryId)).toBeUndefined();
+    const fresh = await Bucket.open({ identity: admin.id, bucketId: A.bucketId, pool, store: new MemoryStore(), relays: RELAYS });
+    expect(fresh.get(v3.entryId)).toBeUndefined();
+    expect(fresh.get(v2.entryId)!.head.authorMember).toBe(bob.id.pk); // pre-revocation writes stay valid
+    // once D syncs it sees its own revocation and refuses to write
     await D.sync();
-    const v3 = await D.write({ type: "fact", title: "revoked agent", body: "z" }).catch(() => null);
+    expect(D.memberPk).toBeNull();
+    await expect(D.write({ type: "fact", title: "after sync", body: "z" })).rejects.toThrow();
+  });
+});
+
+describe("deny, live notifications, relay status", () => {
+  test("deny: recorded in roster, hidden on all admin clients, re-request shows again, approve clears", async () => {
+    const pool = new MockPool();
+    const { admin, bucket: A } = await newBucket(pool);
+    const carol = Identity.generate();
+    await Bucket.requestAccess({ identity: carol, bucketId: A.bucketId, adminPk: admin.id.pk, relays: RELAYS, name: "Carol", pool });
     await A.sync();
-    if (v3) expect(A.get(v3.entryId)).toBeUndefined();
-    void admin;
+    expect(A.pendingRequests().map((r) => r.pk)).toEqual([carol.pk]);
+    await A.deny(carol.pk);
+    expect(A.roster!.denied!.map((d) => d.pk)).toEqual([carol.pk]);
+    expect(A.pendingRequests()).toEqual([]);
+    // co-admin / second session of admin sees it denied too
+    const A2 = await Bucket.open({ identity: admin.id, bucketId: A.bucketId, pool, store: new MemoryStore(), relays: RELAYS });
+    expect(A2.pendingRequests()).toEqual([]);
+    const epoch = A.epoch;
+    expect(epoch).toBe(0); // no rotation
+    // a newer request appears again
+    await tick(1100);
+    await Bucket.requestAccess({ identity: carol, bucketId: A.bucketId, adminPk: admin.id.pk, relays: RELAYS, message: "pls", pool });
+    await A.sync();
+    expect(A.pendingRequests().map((r) => r.pk)).toEqual([carol.pk]);
+    await A.approve(carol.pk);
+    expect(A.roster!.denied ?? []).toEqual([]);
+    await expect(A.deny(carol.pk)).rejects.toThrow(/member/);
+  });
+
+  test("deny refuses invite joiners", async () => {
+    const pool = new MockPool();
+    const { bucket: A } = await newBucket(pool);
+    const { bucket: B } = await joinVia(pool, A);
+    await A.sync();
+    await expect(A.deny(B.identity.pk)).rejects.toThrow(/member|invite/);
+  });
+
+  test("live() fires after local writes and admin actions", async () => {
+    const pool = new MockPool();
+    const { bucket: A } = await newBucket(pool);
+    let n = 0;
+    const stop = A.live(() => n++);
+    await tick(10);
+    n = 0;
+    await A.write({ type: "fact", title: "local", body: "" });
+    await tick(5);
+    expect(n).toBe(1);
+    await A.createInvite();
+    await tick(5);
+    expect(n).toBe(2);
+    await A.rename("New name");
+    await tick(5);
+    expect(n).toBe(3);
+    stop();
+    await A.write({ type: "fact", title: "after stop", body: "" });
+    await tick(5);
+    expect(n).toBe(3);
+  });
+
+  test("relayStatus reflects pool health", async () => {
+    const pool = new MockPool();
+    const { bucket: A } = await newBucket(pool);
+    expect(A.relayStatus().every((r) => r.ok)).toBe(true);
+    pool.down.add(RELAYS[1]!);
+    const s = A.relayStatus();
+    expect(s.find((r) => r.url === RELAYS[1])!.ok).toBe(false);
+    expect(s.find((r) => r.url === RELAYS[0])!.ok).toBe(true);
   });
 });
 
