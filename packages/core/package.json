@@ -1,0 +1,19 @@
+{
+  "name": "@tribe/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./idb": "./src/store/idb.ts",
+    "./file": "./src/store/file.ts"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.25.2",
+    "@noble/hashes": "^1.8.0",
+    "@noble/ciphers": "^1.3.0",
+    "minisearch": "^7.1.2",
+    "idb": "^8.0.3"
+  }
+}
