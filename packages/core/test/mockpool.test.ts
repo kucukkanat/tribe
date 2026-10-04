@@ -1,0 +1,31 @@
+import { expect, test } from "bun:test";
+import { Identity, MockPool } from "../src/index.ts";
+
+test("mockpool filters, replaceable, live subs", async () => {
+  const p = new MockPool();
+  const a = Identity.generate();
+  const R = ["wss://r1"];
+  const e1 = a.sign({ kind: 1, created_at: 100, tags: [["g", "x"]], content: "1" });
+  const e2 = a.sign({ kind: 1, created_at: 200, tags: [["g", "y"]], content: "2" });
+  await p.publish(e1, R); await p.publish(e2, R);
+  expect((await p.query([{ "#g": ["x"] }], R)).map((e) => e.id)).toEqual([e1.id]);
+  expect((await p.query([{ kinds: [1], since: 150 }], R)).length).toBe(1);
+  expect((await p.query([{ kinds: [1], until: 150 }], R)).length).toBe(1);
+  expect((await p.query([{ kinds: [1], limit: 1 }], R))[0]!.id).toBe(e2.id);
+  expect((await p.query([{ authors: [a.pk], ids: [e1.id] }], R)).length).toBe(1);
+  expect((await p.query([{ kinds: [1] }], ["wss://other"])).length).toBe(0);
+  const r1 = a.sign({ kind: 30000, created_at: 10, tags: [["d", "k"]], content: "old" });
+  const r2 = a.sign({ kind: 30000, created_at: 20, tags: [["d", "k"]], content: "new" });
+  await p.publish(r2, R); await p.publish(r1, R);
+  const rs = await p.query([{ kinds: [30000] }], R);
+  expect(rs.map((e) => e.content)).toEqual(["new"]);
+  const got: string[] = [];
+  let eose = false;
+  const close = p.subscribe([{ kinds: [7] }], R, (e) => got.push(e.content), () => (eose = true));
+  await new Promise((r) => setTimeout(r, 5));
+  expect(eose).toBe(true);
+  await p.publish(a.sign({ kind: 7, created_at: 1, tags: [], content: "live" }), R);
+  close();
+  await p.publish(a.sign({ kind: 7, created_at: 2, tags: [], content: "after" }), R);
+  expect(got).toEqual(["live"]);
+});
